@@ -25,6 +25,7 @@ import (
 
 	"github.com/thought-machine/please/src/core"
 	"github.com/thought-machine/please/src/fs"
+	"github.com/thought-machine/please/src/process"
 	"github.com/thought-machine/please/src/worker"
 )
 
@@ -57,21 +58,10 @@ func Build(tid int, state *core.BuildState, label core.BuildLabel, remote bool) 
 		target.SetState(core.Failed)
 		return
 	}
-
-	// Add any of the reverse deps that are now fully built to the queue.
-	for _, reverseDep := range state.Graph.ReverseDependencies(target) {
-		if reverseDep.State() == core.Active && state.Graph.AllDepsBuilt(reverseDep) && reverseDep.SyncUpdateState(core.Active, core.Pending) {
-			state.AddPendingBuild(reverseDep.Label, false)
-		}
-	}
+	// Mark the target as having finished building.
+	target.FinishBuild()
 	if target.IsTest && state.NeedTests && state.IsOriginalTarget(target) {
-		if state.TestSequentially {
-			state.AddPendingTest(target.Label, 1)
-		} else {
-			for runNum := 1; runNum <= state.NumTestRuns; runNum++ {
-				state.AddPendingTest(target.Label, runNum)
-			}
-		}
+		state.AddPendingTest(target)
 	}
 }
 
@@ -97,15 +87,30 @@ func validateBuildTargetBeforeBuild(state *core.BuildState, target *core.BuildTa
 	return nil
 }
 
+func findFilegroupSourcesWithTmpDir(target *core.BuildTarget) []core.BuildLabel {
+	srcs := make([]core.BuildLabel, 0, len(target.Sources))
+	for _, src := range target.Sources {
+		if l, ok := src.Label(); ok {
+			srcs = append(srcs, l)
+		}
+	}
+	return srcs
+}
+
 func prepareOnly(tid int, state *core.BuildState, target *core.BuildTarget) error {
 	if target.IsFilegroup {
+		potentialTargets := findFilegroupSourcesWithTmpDir(target)
+		if len(potentialTargets) > 0 {
+			return fmt.Errorf("can't prepare temporary directory for %s; filegroups don't have temporary directories... Perhaps you meant one of its srcs: %v", target.Label, potentialTargets)
+		}
+
 		return fmt.Errorf("can't prepare temporary directory for %s; filegroups don't have temporary directories", target.Label)
 	}
 	// Ensure we have downloaded any previous dependencies if that's relevant.
-	if err := downloadInputsIfNeeded(tid, state, target); err != nil {
+	if err := state.DownloadInputsIfNeeded(tid, target, false); err != nil {
 		return err
 	}
-	if err := prepareDirectories(target); err != nil {
+	if err := prepareDirectories(state.ProcessExecutor, target); err != nil {
 		return err
 	}
 	if err := prepareSources(state.Graph, target); err != nil {
@@ -178,7 +183,7 @@ func buildTarget(tid int, state *core.BuildState, target *core.BuildTarget, runR
 		}
 	} else {
 		// Ensure we have downloaded any previous dependencies if that's relevant.
-		if err := downloadInputsIfNeeded(tid, state, target); err != nil {
+		if err := state.DownloadInputsIfNeeded(tid, target, false); err != nil {
 			return err
 		}
 
@@ -237,7 +242,7 @@ func buildTarget(tid int, state *core.BuildState, target *core.BuildTarget, runR
 			buildLinks(state, target)
 			return nil
 		}
-		if err := prepareDirectories(target); err != nil {
+		if err := prepareDirectories(state.ProcessExecutor, target); err != nil {
 			return fmt.Errorf("Error preparing directories for %s: %s", target.Label, err)
 		}
 
@@ -284,6 +289,13 @@ func buildTarget(tid int, state *core.BuildState, target *core.BuildTarget, runR
 			return err
 		}
 
+		// Add optional outputs to target metadata
+		metadata.OptionalOutputs = make([]string, 0)
+		for _, output := range fs.Glob(state.Config.Parse.BuildFileName, target.TmpDir(), target.OptionalOutputs, nil, true) {
+			log.Debug("Add discovered optional output to metadata %s", output)
+			metadata.OptionalOutputs = append(metadata.OptionalOutputs, output)
+		}
+
 		metadata.OutputDirOuts, err = addOutputDirectoriesToBuildOutput(target)
 		if err != nil {
 			return err
@@ -317,6 +329,9 @@ func buildTarget(tid int, state *core.BuildState, target *core.BuildTarget, runR
 			state.LogBuildResult(tid, target.Label, core.TargetBuilt, "Built remotely")
 		}
 		if state.ShouldDownload(target) {
+			if err := state.EnsureDownloaded(target); err != nil {
+				return err
+			}
 			buildLinks(state, target)
 		}
 		return nil
@@ -356,7 +371,7 @@ func buildTarget(tid int, state *core.BuildState, target *core.BuildTarget, runR
 	}
 	// Clean up the temporary directory once it's done.
 	if state.CleanWorkdirs {
-		if err := os.RemoveAll(target.TmpDir()); err != nil {
+		if err := fs.ForceRemove(state.ProcessExecutor, target.TmpDir()); err != nil {
 			log.Warning("Failed to remove temporary directory for %s: %s", target.Label, err)
 		}
 	}
@@ -417,7 +432,14 @@ func retrieveArtifacts(tid int, state *core.BuildState, target *core.BuildTarget
 	}
 	state.LogBuildResult(tid, target.Label, core.TargetBuilding, "Checking cache...")
 
-	if retrieveFromCache(state.Cache, target, mustShortTargetHash(state, target), target.Outputs()) != nil {
+	cacheKey := mustShortTargetHash(state, target)
+
+	if md := retrieveFromCache(state.Cache, target, cacheKey, target.Outputs()); md != nil {
+		// Retrieve additional optional outputs from metadata
+		if len(md.OptionalOutputs) > 0 {
+			state.Cache.Retrieve(target, cacheKey, md.OptionalOutputs)
+		}
+
 		log.Debug("Retrieved artifacts for %s from cache", target.Label)
 		checkLicences(state, target)
 		newOutputHash, err := calculateAndCheckRuleHash(state, target)
@@ -433,6 +455,16 @@ func retrieveArtifacts(tid int, state *core.BuildState, target *core.BuildTarget
 			state.LogBuildResult(tid, target.Label, core.TargetCached, "Cached (unchanged)")
 		}
 		buildLinks(state, target)
+
+		// If we could've potentially pulled from the http cache, we need to write the xattrs back as they will be
+		// missing.
+		if state.Config.Cache.HTTPURL != "" {
+			if err := writeRuleHash(state, target); err != nil {
+				log.Warningf("failed to write target hash: %w", err)
+				return false
+			}
+		}
+
 		return true // got from cache
 	}
 	log.Debug("Nothing retrieved from remote cache for %s", target.Label)
@@ -445,13 +477,32 @@ func runBuildCommand(state *core.BuildState, target *core.BuildTarget, command s
 	if target.IsRemoteFile {
 		return nil, fetchRemoteFile(state, target)
 	}
-	env := core.StampedBuildEnvironment(state, target, inputHash, path.Join(core.RepoRoot, target.TmpDir()))
+	if target.IsTextFile {
+		return nil, buildTextFile(state, target)
+	}
+	env := core.StampedBuildEnvironment(state, target, inputHash, path.Join(core.RepoRoot, target.TmpDir()), target.Stamp)
 	log.Debug("Building target %s\nENVIRONMENT:\n%s\n%s", target.Label, env, command)
-	out, combined, err := state.ProcessExecutor.ExecWithTimeoutShell(target, target.TmpDir(), env, target.BuildTimeout, state.ShowAllOutput, command, target.Sandbox)
+	out, combined, err := state.ProcessExecutor.ExecWithTimeoutShell(target, target.TmpDir(), env, target.BuildTimeout, state.ShowAllOutput, target.Sandbox, command)
 	if err != nil {
 		return nil, fmt.Errorf("Error building target %s: %s\n%s", target.Label, err, combined)
 	}
 	return out, nil
+}
+
+// buildTextFile runs the build action for text_file() rules
+func buildTextFile(state *core.BuildState, target *core.BuildTarget) error {
+	outs := target.Outputs()
+	if len(outs) != 1 {
+		return fmt.Errorf("text_file %s should have a single output, has %d", target.Label, len(outs))
+	}
+	outFile := filepath.Join(target.TmpDir(), outs[0])
+
+	content, err := target.GetFileContent(state)
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(outFile, []byte(content), target.OutMode())
 }
 
 // prepareOutputDirectories creates any directories the target has declared it will output into as a nicety
@@ -485,19 +536,19 @@ func prepareParentDirs(target *core.BuildTarget, out string) error {
 }
 
 // Prepares the temp and out directories for a target
-func prepareDirectories(target *core.BuildTarget) error {
-	if err := prepareDirectory(target.TmpDir(), true); err != nil {
+func prepareDirectories(executor *process.Executor, target *core.BuildTarget) error {
+	if err := prepareDirectory(executor, target.TmpDir(), true); err != nil {
 		return err
 	}
 	if err := prepareOutputDirectories(target); err != nil {
 		return err
 	}
-	return prepareDirectory(target.OutDir(), false)
+	return prepareDirectory(executor, target.OutDir(), false)
 }
 
-func prepareDirectory(directory string, remove bool) error {
+func prepareDirectory(executor *process.Executor, directory string, remove bool) error {
 	if remove && core.PathExists(directory) {
-		if err := os.RemoveAll(directory); err != nil {
+		if err := fs.ForceRemove(executor, directory); err != nil {
 			return err
 		}
 	}
@@ -713,36 +764,20 @@ func checkForStaleOutput(filename string, err error) bool {
 	return false
 }
 
-// downloadInputs downloads all the inputs for this target if we are building remotely.
-func downloadInputsIfNeeded(tid int, state *core.BuildState, target *core.BuildTarget) error {
-	if state.RemoteClient != nil {
-		state.LogBuildResult(tid, target.Label, core.TargetBuilding, "Downloading inputs...")
-		for input := range core.IterInputs(state.Graph, target, true, false) {
-			if l := input.Label(); l != nil {
-				dep := state.Graph.TargetOrDie(*l)
-				if s := dep.State(); s == core.BuiltRemotely || s == core.ReusedRemotely {
-					if err := state.RemoteClient.Download(dep); err != nil {
-						return err
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-
 // calculateAndCheckRuleHash checks the output hash for a rule.
 func calculateAndCheckRuleHash(state *core.BuildState, target *core.BuildTarget) ([]byte, error) {
 	hash, err := state.TargetHasher.OutputHash(target)
 	if err != nil {
 		return nil, err
 	}
+
 	if err = checkRuleHashes(state, target, hash); err != nil {
 		if state.NeedHashesOnly && state.IsOriginalTargetOrParent(target) {
-			return nil, errStop
-		} else if state.VerifyHashes {
-			return nil, err
+			log.Info("Updated hash for %v: %v", target, string(hash))
 		} else {
+			if state.VerifyHashes {
+				return nil, err
+			}
 			log.Warning("%s", err)
 		}
 	}
@@ -960,39 +995,27 @@ func checkLicences(state *core.BuildState, target *core.BuildTarget) {
 func buildLinks(state *core.BuildState, target *core.BuildTarget) {
 	buildLinksOfType(state, target, "link:", os.Symlink)
 	buildLinksOfType(state, target, "hlink:", os.Link)
+
+	if state.Config.Build.LinkGeneratedSources && target.HasLabel("codegen") {
+		for _, out := range target.Outputs() {
+			destDir := path.Join(core.RepoRoot, target.Label.PackageDir())
+			srcDir := path.Join(core.RepoRoot, target.OutDir())
+			fs.LinkIfNotExists(path.Join(srcDir, out), path.Join(destDir, out), os.Symlink)
+		}
+	}
 }
 
-type linkFunc func(string, string) error
-
-func buildLinksOfType(state *core.BuildState, target *core.BuildTarget, prefix string, f linkFunc) {
+func buildLinksOfType(state *core.BuildState, target *core.BuildTarget, prefix string, f fs.LinkFunc) {
 	if labels := target.PrefixedLabels(prefix); len(labels) > 0 {
 		env := core.TargetEnvironment(state, target)
 		for _, dest := range labels {
 			destDir := path.Join(core.RepoRoot, os.Expand(dest, env.ReplaceEnvironment))
 			srcDir := path.Join(core.RepoRoot, target.OutDir())
 			for _, out := range target.Outputs() {
-				linkIfNotExists(path.Join(srcDir, out), path.Join(destDir, out), f)
+				fs.LinkIfNotExists(path.Join(srcDir, out), path.Join(destDir, out), f)
 			}
 		}
 	}
-}
-
-// linkIfNotExists creates dest as a link to src if it doesn't already exist.
-func linkIfNotExists(src, dest string, f linkFunc) {
-	if fs.PathExists(dest) {
-		return
-	}
-	fs.Walk(src, func(name string, isDir bool) error {
-		if !isDir {
-			fullDest := path.Join(dest, name[len(src):])
-			if err := fs.EnsureDir(fullDest); err != nil {
-				log.Warning("Failed to create directory for %s: %s", fullDest, err)
-			} else if err := f(name, fullDest); err != nil && !os.IsExist(err) {
-				log.Warning("Failed to create %s: %s", fullDest, err)
-			}
-		}
-		return nil
-	})
 }
 
 // fetchRemoteFile fetches a remote file from a URL.
@@ -1007,9 +1030,9 @@ func fetchRemoteFile(state *core.BuildState, target *core.BuildTarget) error {
 
 		httpClient.Timeout = time.Duration(state.Config.Build.Timeout)
 	})
-	if err := prepareDirectory(target.OutDir(), false); err != nil {
+	if err := prepareDirectory(state.ProcessExecutor, target.OutDir(), false); err != nil {
 		return err
-	} else if err := prepareDirectory(target.TmpDir(), false); err != nil {
+	} else if err := prepareDirectory(state.ProcessExecutor, target.TmpDir(), false); err != nil {
 		return err
 	}
 	var err error

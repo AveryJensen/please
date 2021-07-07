@@ -4,6 +4,7 @@ package core
 
 import (
 	"encoding/base64"
+	"github.com/stretchr/testify/require"
 	"io/ioutil"
 	"os"
 	"path"
@@ -272,6 +273,20 @@ func TestCrossCompileReplacement(t *testing.T) {
 	assert.Equal(t, expected, replaceSequences(state, target1))
 }
 
+func TestEntryPoints(t *testing.T) {
+	target := NewBuildTarget(ParseBuildLabel("//tools:foo", ""))
+	target.EntryPoints = map[string]string{"some_ep": "bin/some_ep"}
+	target.IsBinary = true
+	target.AddOutput("bin/some_ep")
+	graph := NewGraph()
+	graph.AddTarget(target)
+
+	cmd, err := ReplaceSequences(state, target, "$(out_exe //tools:foo|some_ep)")
+	require.NoError(t, err)
+
+	require.Equal(t, "plz-out/bin/tools/bin/some_ep", cmd)
+}
+
 func makeTarget2(name string, command string, dep *BuildTarget) *BuildTarget {
 	target := NewBuildTarget(ParseBuildLabel(name, ""))
 	target.Command = command
@@ -282,7 +297,10 @@ func makeTarget2(name string, command string, dep *BuildTarget) *BuildTarget {
 		graph := NewGraph()
 		graph.AddTarget(target)
 		graph.AddTarget(dep)
-		graph.AddDependency(target.Label, dep.Label)
+		target.AddDependency(dep.Label)
+		if err := target.ResolveDependencies(graph); err != nil {
+			log.Fatalf("Failed to resolve some dependencies for %s: %s", target, err)
+		}
 	}
 	return target
 }

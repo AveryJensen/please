@@ -49,7 +49,7 @@ class ReleaseGen:
             })
         self.version = self.read_file('VERSION').strip()
         self.version_name = 'Version ' + self.version
-        self.is_prerelease = 'a' in self.version or 'b' in self.version
+        self.is_prerelease = '-' in self.version
         self.known_content_types = {
             '.gz': 'application/gzip',
             '.xz': 'application/x-xz',
@@ -103,11 +103,12 @@ class ReleaseGen:
         print('%s uploaded' % filename)
 
     def _arch(self, artifact:str) -> str:
+        cpu = 'amd64' if 'amd64' in artifact else 'arm64'
         if 'darwin' in artifact:
-            return 'darwin_amd64'
+            return f'darwin_{cpu}'
         elif 'freebsd' in artifact:
-            return 'freebsd_amd64'
-        return 'linux_amd64'
+            return f'freebsd_{cpu}'
+        return f'linux_{cpu}'
 
     def sign(self, artifact:str) -> str:
         """Creates a detached ASCII-armored signature for an artifact."""

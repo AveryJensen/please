@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/streamrail/concurrent-map"
+	cmap "github.com/streamrail/concurrent-map"
 	"gopkg.in/op/go-logging.v1"
 
 	"github.com/thought-machine/please/src/cli"
@@ -118,7 +118,7 @@ func startWatching(watcher *fsnotify.Watcher, state *core.BuildState, labels []c
 }
 
 func addSource(watcher *fsnotify.Watcher, state *core.BuildState, source core.BuildInput, dirs map[string]struct{}, files cmap.ConcurrentMap) {
-	if source.Label() == nil {
+	if _, ok := source.Label(); !ok {
 		for _, src := range source.Paths(state.Graph) {
 			if err := fs.Walk(src, func(src string, isDir bool) error {
 				files.Set(src, struct{}{})
@@ -177,6 +177,6 @@ func build(ctx context.Context, state *core.BuildState, labels []core.BuildLabel
 				BuildLabel: l,
 			}
 		}
-		go run.Parallel(ctx, state, als, nil, state.Config.Please.NumThreads, false, false, false, false, "", cli.Arch{})
+		go run.Parallel(ctx, state, als, nil, state.Config.Please.NumThreads, run.Default, false, false, false, false, "")
 	}
 }

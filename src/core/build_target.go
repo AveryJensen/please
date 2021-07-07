@@ -2,7 +2,6 @@ package core
 
 import (
 	"fmt"
-	"github.com/thought-machine/please/src/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -11,6 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/thought-machine/please/src/fs"
 )
 
 // OutDir is the root output directory for everything.
@@ -133,6 +136,8 @@ type BuildTarget struct {
 	IsFilegroup bool `print:"false"`
 	// Marks the target as a remote_file.
 	IsRemoteFile bool `print:"false"`
+	// Marks the target as a text_file.
+	IsTextFile bool `print:"false"`
 	// Marks that the target was added in a post-build function.
 	AddedPostBuild bool `print:"false"`
 	// If true, the interactive progress display will try to infer the target's progress
@@ -144,8 +149,6 @@ type BuildTarget struct {
 	Results TestSuite `print:"false"`
 	// The number of completed runs
 	completedRuns int `print:"false"`
-	// A mutex to control access to Results
-	resultsMux sync.Mutex `print:"false"`
 	// Description displayed while the command is building.
 	// Default is just "Building" but it can be customised.
 	BuildingDescription string `name:"building_description"`
@@ -199,10 +202,16 @@ type BuildTarget struct {
 	// output for the rule. For example if an output directory "foo" contains "bar.txt" the rule will have the output
 	// "bar.txt"
 	OutputDirectories []OutputDirectory `name:"output_dirs"`
-	// RuleMetadata is the metadata attached to this build rule. It can be accessed through the "get_rule_metadata" BIF.
-	RuleMetadata interface{} `name:"config"`
 	// EntryPoints represent named binaries within the rules output that can be targeted via //package:rule|entry_point_name
 	EntryPoints map[string]string `name:"entry_points"`
+	// Used to arbitrate concurrent access to dependencies, and to the test results.
+	mutex sync.RWMutex `print:"false"`
+	// Used to notify once this target has built successfully.
+	finishedBuilding chan struct{} `print:"false"`
+	// Env are any custom environment variables to set for this build target
+	Env map[string]string `name:"env"`
+	// The content of text_file() rules
+	FileContent string `name:"content"`
 }
 
 // BuildMetadata is temporary metadata that's stored around a build target - we don't
@@ -215,6 +224,8 @@ type BuildMetadata struct {
 	// Time this action was written. Used for remote execution to determine if
 	// the action is stale and needs re-checking or not.
 	Timestamp time.Time
+	// Additional optional outputs found from wildcard
+	OptionalOutputs []string
 	// Additional outputs from output directories serialised as a csv
 	OutputDirOuts []string
 	// True if this represents a test run.
@@ -323,6 +334,7 @@ func NewBuildTarget(label BuildLabel) *BuildTarget {
 		Label:               label,
 		state:               int32(Inactive),
 		BuildingDescription: DefaultBuildingDescription,
+		finishedBuilding:    make(chan struct{}),
 	}
 }
 
@@ -365,8 +377,8 @@ func (target *BuildTarget) TestDirs() string {
 
 // CompleteRun completes a run and returns true if this was the last run
 func (target *BuildTarget) CompleteRun(state *BuildState) bool {
-	target.resultsMux.Lock()
-	defer target.resultsMux.Unlock()
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
 
 	target.completedRuns++
 	return target.completedRuns == state.NumTestRuns
@@ -384,8 +396,8 @@ func (target *BuildTarget) CoverageFile() string {
 
 // AddTestResults adds results to the target
 func (target *BuildTarget) AddTestResults(results TestSuite) {
-	target.resultsMux.Lock()
-	defer target.resultsMux.Unlock()
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
 
 	if len(target.Results.TestCases) == 0 {
 		target.Results.Cached = results.Cached // On the first run we take whatever this is
@@ -397,13 +409,13 @@ func (target *BuildTarget) AddTestResults(results TestSuite) {
 
 // StartTestSuite sets the initial properties on the result test suite
 func (target *BuildTarget) StartTestSuite() {
-	target.resultsMux.Lock()
-	defer target.resultsMux.Unlock()
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
 
 	// If the results haven't been set yet, set them
 	if target.Results.Name == "" {
 		target.Results = TestSuite{
-			Package:   strings.Replace(target.Label.PackageName, "/", ".", -1),
+			Package:   strings.ReplaceAll(target.Label.PackageName, "/", "."),
 			Name:      target.Label.Name,
 			Timestamp: time.Now().Format(time.RFC3339),
 		}
@@ -440,8 +452,8 @@ func (target *BuildTarget) allSourcePaths(graph *BuildGraph, full buildPathsFunc
 // AllURLs returns all the URLs for this target.
 // This should only be called if the target is a remote file.
 // The URLs will have any embedded environment variables expanded according to the given config.
-func (target *BuildTarget) AllURLs(config *Configuration) []string {
-	env := GeneralBuildEnvironment(config)
+func (target *BuildTarget) AllURLs(state *BuildState) []string {
+	env := GeneralBuildEnvironment(state)
 	ret := make([]string, len(target.Sources))
 	for i, s := range target.Sources {
 		ret[i] = os.Expand(string(s.(URLLabel)), env.ReplaceEnvironment)
@@ -449,8 +461,65 @@ func (target *BuildTarget) AllURLs(config *Configuration) []string {
 	return ret
 }
 
+// resolveDependencies matches up all declared dependencies to the actual build targets.
+// TODO(peterebden,tatskaari): Work out if we really want to have this and how the suite of *Dependencies functions
+//                             below should behave (preferably nicely).
+// TODO(tatskaari): Work out if we can use a channel instead of a callback.
+func (target *BuildTarget) resolveDependencies(graph *BuildGraph, callback func(*BuildTarget) error) error {
+	var g errgroup.Group
+	target.mutex.RLock()
+	for i := range target.dependencies {
+		dep := &target.dependencies[i]
+		if len(dep.deps) > 0 {
+			continue // already done
+		}
+		g.Go(func() error {
+			if err := target.resolveOneDependency(graph, dep); err != nil {
+				return err
+			}
+			for _, d := range dep.deps {
+				if err := callback(d); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	target.mutex.RUnlock()
+	return g.Wait()
+}
+
+func (target *BuildTarget) resolveOneDependency(graph *BuildGraph, dep *depInfo) error {
+	t := graph.WaitForTarget(dep.declared)
+	if t == nil {
+		return fmt.Errorf("Couldn't find dependency %s", dep.declared)
+	}
+	labels := t.provideFor(target)
+	if len(labels) == 0 {
+		// Small optimisation to avoid re-looking-up the same target again.
+		dep.deps = []*BuildTarget{t}
+		return nil
+	}
+	for _, l := range labels {
+		t := graph.WaitForTarget(l)
+		if t == nil {
+			return fmt.Errorf("%s depends on %s (provided by %s), however that target doesn't exist", target, l, t)
+		}
+		dep.deps = append(dep.deps, t)
+	}
+	return nil
+}
+
+// MustResolveDependencies is exposed only for testing purposes.
+// TODO(peterebden, tatskaari): See if we can get rid of this.
+func (target *BuildTarget) ResolveDependencies(graph *BuildGraph) error {
+	return target.resolveDependencies(graph, func(*BuildTarget) error { return nil })
+}
+
 // DeclaredDependencies returns all the targets this target declared any kind of dependency on (including sources and tools).
 func (target *BuildTarget) DeclaredDependencies() []BuildLabel {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	ret := make(BuildLabels, len(target.dependencies))
 	for i, dep := range target.dependencies {
 		ret[i] = dep.declared
@@ -461,6 +530,8 @@ func (target *BuildTarget) DeclaredDependencies() []BuildLabel {
 
 // DeclaredDependenciesStrict returns the original declaration of this target's dependencies.
 func (target *BuildTarget) DeclaredDependenciesStrict() []BuildLabel {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	ret := make(BuildLabels, 0, len(target.dependencies))
 	for _, dep := range target.dependencies {
 		if !dep.exported && !dep.source && !target.IsTool(dep.declared) {
@@ -473,6 +544,8 @@ func (target *BuildTarget) DeclaredDependenciesStrict() []BuildLabel {
 
 // Dependencies returns the resolved dependencies of this target.
 func (target *BuildTarget) Dependencies() []*BuildTarget {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	ret := make(BuildTargets, 0, len(target.dependencies))
 	for _, deps := range target.dependencies {
 		for _, dep := range deps.deps {
@@ -485,6 +558,8 @@ func (target *BuildTarget) Dependencies() []*BuildTarget {
 
 // ExternalDependencies returns the non-internal dependencies of this target (i.e. not "_target#tag" ones).
 func (target *BuildTarget) ExternalDependencies() []*BuildTarget {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	ret := make(BuildTargets, 0, len(target.dependencies))
 	for _, deps := range target.dependencies {
 		for _, dep := range deps.deps {
@@ -501,6 +576,8 @@ func (target *BuildTarget) ExternalDependencies() []*BuildTarget {
 
 // BuildDependencies returns the build-time dependencies of this target (i.e. not data and not internal).
 func (target *BuildTarget) BuildDependencies() []*BuildTarget {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	ret := make(BuildTargets, 0, len(target.dependencies))
 	for _, deps := range target.dependencies {
 		if !deps.data && !deps.internal {
@@ -515,6 +592,8 @@ func (target *BuildTarget) BuildDependencies() []*BuildTarget {
 
 // ExportedDependencies returns any exported dependencies of this target.
 func (target *BuildTarget) ExportedDependencies() []BuildLabel {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	ret := make(BuildLabels, 0, len(target.dependencies))
 	for _, info := range target.dependencies {
 		if info.exported {
@@ -526,14 +605,30 @@ func (target *BuildTarget) ExportedDependencies() []BuildLabel {
 
 // DependenciesFor returns the dependencies that relate to a given label.
 func (target *BuildTarget) DependenciesFor(label BuildLabel) []*BuildTarget {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
+	return target.dependenciesFor(label)
+}
+
+func (target *BuildTarget) dependenciesFor(label BuildLabel) []*BuildTarget {
 	if info := target.dependencyInfo(label); info != nil {
 		return info.deps
 	} else if target.Label.Subrepo != "" && label.Subrepo == "" {
 		// Can implicitly use the target's subrepo.
 		label.Subrepo = target.Label.Subrepo
-		return target.DependenciesFor(label)
+		return target.dependenciesFor(label)
 	}
 	return nil
+}
+
+// FinishBuild marks this target as having built.
+func (target *BuildTarget) FinishBuild() {
+	close(target.finishedBuilding)
+}
+
+// WaitForBuild blocks until this target has finished building.
+func (target *BuildTarget) WaitForBuild() {
+	<-target.finishedBuilding
 }
 
 // DeclaredOutputs returns the outputs from this target's original declaration.
@@ -570,10 +665,10 @@ func (target *BuildTarget) Outputs() []string {
 				for _, dep := range target.DependenciesFor(namedLabel.BuildLabel) {
 					ret = append(ret, dep.NamedOutputs(namedLabel.Annotation)...)
 				}
-			} else if label := src.nonOutputLabel(); label == nil {
+			} else if label, ok := src.nonOutputLabel(); !ok {
 				ret = append(ret, src.LocalPaths(nil)[0])
 			} else {
-				for _, dep := range target.DependenciesFor(*label) {
+				for _, dep := range target.DependenciesFor(label) {
 					ret = append(ret, dep.Outputs()...)
 				}
 			}
@@ -598,6 +693,19 @@ func (target *BuildTarget) FullOutputs() []string {
 	outDir := target.OutDir()
 	for i, out := range outs {
 		outs[i] = path.Join(outDir, out)
+	}
+	return outs
+}
+
+// AllOutputs returns a slice of all the outputs of this rule, including any output directories.
+// Outs are passed through GetTmpOutput as appropriate.
+func (target *BuildTarget) AllOutputs() []string {
+	outs := target.Outputs()
+	for i, out := range outs {
+		outs[i] = target.GetTmpOutput(out)
+	}
+	for _, out := range target.OutputDirectories {
+		outs = append(outs, out.Dir())
 	}
 	return outs
 }
@@ -663,40 +771,14 @@ func (target *BuildTarget) SourcePaths(graph *BuildGraph, sources []BuildInput) 
 
 // sourcePaths returns the source paths for a single source.
 func (target *BuildTarget) sourcePaths(graph *BuildGraph, source BuildInput, f buildPathsFunc) []string {
-	if label := source.nonOutputLabel(); label != nil {
+	if label, ok := source.nonOutputLabel(); ok {
 		ret := []string{}
-		for _, providedLabel := range graph.TargetOrDie(*label).ProvideFor(target) {
+		for _, providedLabel := range graph.TargetOrDie(label).ProvideFor(target) {
 			ret = append(ret, f(providedLabel, graph)...)
 		}
 		return ret
 	}
 	return f(source, graph)
-}
-
-// allDepsBuilt returns true if all the dependencies of a target are built.
-func (target *BuildTarget) allDepsBuilt() bool {
-	if !target.allDependenciesResolved() {
-		return false // Target still has some deps pending parse.
-	}
-	for _, deps := range target.dependencies {
-		for _, dep := range deps.deps {
-			if dep.State() < Built {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// allDependenciesResolved returns true once all the dependencies of a target have been
-// parsed and resolved to real targets.
-func (target *BuildTarget) allDependenciesResolved() bool {
-	for _, deps := range target.dependencies {
-		if !deps.resolved {
-			return false
-		}
-	}
-	return true
 }
 
 // CanSee returns true if target can see the given dependency, or false if not.
@@ -767,13 +849,13 @@ func (target *BuildTarget) CheckTargetOwnsBuildOutputs(state *BuildState) error 
 
 // CheckTargetOwnsBuildInputs checks that any file inputs to this rule belong to this package.
 func (target *BuildTarget) CheckTargetOwnsBuildInputs(state *BuildState) error {
-	for _, input := range target.Sources {
+	for _, input := range target.AllSources() {
 		if err := target.checkTargetOwnsBuildInput(state, input); err != nil {
 			return err
 		}
 	}
 
-	for _, input := range target.Data {
+	for _, input := range target.AllData() {
 		if err := target.checkTargetOwnsBuildInput(state, input); err != nil {
 			return err
 		}
@@ -843,17 +925,16 @@ func (target *BuildTarget) AllSecrets() []string {
 
 // HasDependency checks if a target already depends on this label.
 func (target *BuildTarget) HasDependency(label BuildLabel) bool {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
 	return target.dependencyInfo(label) != nil
 }
 
-// hasResolvedDependency returns true if a particular dependency has been resolved to real targets yet.
-func (target *BuildTarget) hasResolvedDependency(label BuildLabel) bool {
-	info := target.dependencyInfo(label)
-	return info != nil && info.resolved
-}
-
 // resolveDependency resolves a particular dependency on a target.
+// TODO(jpoole): this is only used by tests: remove
 func (target *BuildTarget) resolveDependency(label BuildLabel, dep *BuildTarget) {
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
 	info := target.dependencyInfo(label)
 	if info == nil {
 		target.dependencies = append(target.dependencies, depInfo{declared: label})
@@ -985,27 +1066,39 @@ func (target *BuildTarget) AddProvide(language string, label BuildLabel) {
 
 // ProvideFor returns the build label that we'd provide for the given target.
 func (target *BuildTarget) ProvideFor(other *BuildTarget) []BuildLabel {
-	ret := []BuildLabel{}
-	if target.Provides != nil && len(other.Requires) != 0 {
-		// Never do this if the other target has a data or tool dependency on us.
-		for _, data := range other.Data {
-			if label := data.Label(); label != nil && *label == target.Label {
-				return []BuildLabel{target.Label}
-			}
-		}
-		if other.IsTool(target.Label) {
-			return []BuildLabel{target.Label}
-		}
-		for _, require := range other.Requires {
-			if label, present := target.Provides[require]; present {
-				ret = append(ret, label)
-			}
-		}
-		if len(ret) > 0 {
-			return ret
-		}
+	if p := target.provideFor(other); len(p) > 0 {
+		return p
 	}
 	return []BuildLabel{target.Label}
+}
+
+// provideFor is like ProvideFor but returns an empty slice if there is a direct dependency.
+// It's a small optimisation to save allocating extra slices.
+func (target *BuildTarget) provideFor(other *BuildTarget) []BuildLabel {
+	target.mutex.RLock()
+	defer target.mutex.RUnlock()
+	if target.Provides == nil || len(other.Requires) == 0 {
+		return nil
+	}
+	// Never do this if the other target has a data or tool dependency on us.
+	for _, data := range other.Data {
+		if label, ok := data.Label(); ok && label == target.Label {
+			return nil
+		}
+	}
+	if other.IsTool(target.Label) {
+		return nil
+	}
+	var ret []BuildLabel
+	for _, require := range other.Requires {
+		if label, present := target.Provides[require]; present {
+			if ret == nil {
+				ret = make([]BuildLabel, 0, len(other.Requires))
+			}
+			ret = append(ret, label)
+		}
+	}
+	return ret
 }
 
 // UnprefixedHashes returns the hashes for the target without any prefixes;
@@ -1033,8 +1126,8 @@ func (target *BuildTarget) addSource(sources []BuildInput, source BuildInput) []
 		}
 	}
 	// Add a dependency if this is not just a file.
-	if label := source.Label(); label != nil {
-		target.AddMaybeExportedDependency(*label, false, true, false)
+	if label, ok := source.Label(); ok {
+		target.AddMaybeExportedDependency(label, false, true, false)
 	}
 	return append(sources, source)
 }
@@ -1077,28 +1170,25 @@ func (target *BuildTarget) AddNamedSecret(name string, secret string) {
 // AddTool adds a new tool to the target.
 func (target *BuildTarget) AddTool(tool BuildInput) {
 	target.Tools = append(target.Tools, tool)
-	if label := tool.Label(); label != nil {
-		target.AddDependency(*label)
+	if label, ok := tool.Label(); ok {
+		target.AddDependency(label)
 	}
 }
 
 // AddTestTool adds a new test tool to the target.
 func (target *BuildTarget) AddTestTool(tool BuildInput) {
 	target.testTools = append(target.testTools, tool)
-	if label := tool.Label(); label != nil {
-		target.AddDependency(*label)
+	if label, ok := tool.Label(); ok {
+		target.AddDependency(label)
 	}
 }
 
-func (target *BuildTarget) TestTools() []BuildInput {
-	if len(target.namedTestTools) > 0 {
-		var tools []BuildInput
-		for _, tool := range target.namedTestTools {
-			tools = append(tools, tool...)
-		}
-		return tools
+// AllTestTools returns all the test tool paths for this rule.
+func (target *BuildTarget) AllTestTools() []BuildInput {
+	if target.namedTestTools == nil {
+		return target.testTools
 	}
-	return target.testTools
+	return target.allBuildInputs(target.testTools, target.namedTestTools)
 }
 
 func (target *BuildTarget) NamedTestTools() map[string][]BuildInput {
@@ -1108,9 +1198,9 @@ func (target *BuildTarget) NamedTestTools() map[string][]BuildInput {
 // AddDatum adds a new item of data to the target.
 func (target *BuildTarget) AddDatum(datum BuildInput) {
 	target.Data = append(target.Data, datum)
-	if label := datum.Label(); label != nil {
-		target.AddDependency(*label)
-		target.dependencyInfo(*label).data = true
+	if label, ok := datum.Label(); ok {
+		target.AddDependency(label)
+		target.dependencyInfo(label).data = true
 	}
 }
 
@@ -1121,9 +1211,9 @@ func (target *BuildTarget) AddNamedDatum(name string, datum BuildInput) {
 	} else {
 		target.namedData[name] = append(target.namedData[name], datum)
 	}
-	if label := datum.Label(); label != nil {
-		target.AddDependency(*label)
-		target.dependencyInfo(*label).data = true
+	if label, ok := datum.Label(); ok {
+		target.AddDependency(label)
+		target.dependencyInfo(label).data = true
 	}
 }
 
@@ -1134,8 +1224,8 @@ func (target *BuildTarget) AddNamedTool(name string, tool BuildInput) {
 	} else {
 		target.namedTools[name] = append(target.namedTools[name], tool)
 	}
-	if label := tool.Label(); label != nil {
-		target.AddDependency(*label)
+	if label, ok := tool.Label(); ok {
+		target.AddDependency(label)
 	}
 }
 
@@ -1146,8 +1236,8 @@ func (target *BuildTarget) AddNamedTestTool(name string, tool BuildInput) {
 	} else {
 		target.namedTestTools[name] = append(target.namedTestTools[name], tool)
 	}
-	if label := tool.Label(); label != nil {
-		target.AddDependency(*label)
+	if label, ok := tool.Label(); ok {
+		target.AddDependency(label)
 	}
 }
 
@@ -1218,25 +1308,32 @@ func (target *BuildTarget) getCommand(state *BuildState, commands map[string]str
 
 // AllSources returns all the sources of this rule.
 func (target *BuildTarget) AllSources() []BuildInput {
-	ret := target.Sources[:]
-	if target.NamedSources != nil {
-		keys := make([]string, 0, len(target.NamedSources))
-		for k := range target.NamedSources {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			ret = append(ret, target.NamedSources[k]...)
-		}
+	if target.NamedSources == nil {
+		return target.Sources
 	}
+	return target.allBuildInputs(target.Sources, target.NamedSources)
+}
+
+func (target *BuildTarget) allBuildInputs(unnamed []BuildInput, named map[string][]BuildInput) []BuildInput {
+	ret := unnamed
+	keys := make([]string, 0, len(named))
+	for k := range named {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		ret = append(ret, named[k]...)
+	}
+
 	return ret
 }
 
 // AllLocalSources returns all the "local" sources of this rule, i.e. all sources that are
 // actually sources in the repo, not other rules or system srcs etc.
 func (target *BuildTarget) AllLocalSources() []string {
-	ret := []string{}
-	for _, src := range target.AllSources() {
+	srcs := target.AllSources()
+	ret := make([]string, 0, len(srcs))
+	for _, src := range srcs {
 		if file, ok := src.(FileLabel); ok {
 			ret = append(ret, file.Paths(nil)[0])
 		}
@@ -1261,20 +1358,13 @@ func (target *BuildTarget) HasAbsoluteSource(source string) bool {
 	return target.HasSource(strings.TrimPrefix(source, target.Label.PackageName+"/"))
 }
 
-// AllData returns all the data files for this rule.
+// AllData returns all the sources of this rule.
 func (target *BuildTarget) AllData() []BuildInput {
-	ret := target.Data[:]
-	if target.namedData != nil {
-		keys := make([]string, 0, len(target.namedData))
-		for k := range target.namedData {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			ret = append(ret, target.namedData[k]...)
-		}
+	if target.namedData == nil {
+		return target.Data
 	}
-	return ret
+
+	return target.allBuildInputs(target.Data, target.namedData)
 }
 
 func (target *BuildTarget) NamedData() map[string][]BuildInput {
@@ -1293,14 +1383,9 @@ func (target *BuildTarget) AllDataPaths(graph *BuildGraph) []string {
 // AllTools returns all the tools for this rule in some canonical order.
 func (target *BuildTarget) AllTools() []BuildInput {
 	if target.namedTools == nil {
-		return target.Tools // Leave them in input order, that's sufficiently consistent.
+		return target.Tools
 	}
-	tools := make([]BuildInput, len(target.Tools), len(target.Tools)+len(target.namedTools)*2)
-	copy(tools, target.Tools)
-	for _, name := range target.ToolNames() {
-		tools = append(tools, target.namedTools[name]...)
-	}
-	return tools
+	return target.allBuildInputs(target.Tools, target.namedTools)
 }
 
 // ToolNames returns an ordered list of tool names.
@@ -1346,13 +1431,13 @@ func (target *BuildTarget) AddMaybeExportedDependency(dep BuildLabel, exported, 
 // IsTool returns true if the given build label is a tool used by this target.
 func (target *BuildTarget) IsTool(tool BuildLabel) bool {
 	for _, t := range target.Tools {
-		if t.Label() != nil && *t.Label() == tool {
+		if label, ok := t.Label(); ok && label == tool {
 			return true
 		}
 	}
 	for _, tools := range target.namedTools {
 		for _, t := range tools {
-			if t.Label() != nil && *t.Label() == tool {
+			if label, ok := t.Label(); ok && label == tool {
 				return true
 			}
 		}
@@ -1530,6 +1615,11 @@ func (target *BuildTarget) BuildCouldModifyTarget() bool {
 // AddOutputDirectory adds an output directory to the target
 func (target *BuildTarget) AddOutputDirectory(dir string) {
 	target.OutputDirectories = append(target.OutputDirectories, OutputDirectory(dir))
+}
+
+// GetFileContent returns the file content, expanding it if it needs to
+func (target *BuildTarget) GetFileContent(state *BuildState) (string, error) {
+	return ReplaceSequences(state, target, target.FileContent)
 }
 
 // BuildTargets makes a slice of build targets sortable by their labels.

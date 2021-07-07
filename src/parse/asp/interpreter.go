@@ -1,13 +1,16 @@
 package asp
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"runtime/debug"
+	"runtime/pprof"
 	"strings"
 	"sync"
 
 	"github.com/thought-machine/please/src/core"
+	"github.com/thought-machine/please/src/fs"
 )
 
 // An interpreter holds the package-independent state about our parsing process.
@@ -20,12 +23,14 @@ type interpreter struct {
 	configMutex     sync.RWMutex
 	breakpointMutex sync.Mutex
 	limiter         semaphore
+	profiling       bool
 }
 
 // newInterpreter creates and returns a new interpreter instance.
 // It loads all the builtin rules at this point.
 func newInterpreter(state *core.BuildState, p *Parser) *interpreter {
 	s := &scope{
+		ctx:    context.Background(),
 		state:  state,
 		locals: map[string]pyObject{},
 	}
@@ -35,6 +40,7 @@ func newInterpreter(state *core.BuildState, p *Parser) *interpreter {
 		subincludes: map[string]pyDict{},
 		config:      map[*core.Configuration]*pyConfig{},
 		limiter:     make(semaphore, state.Config.Parse.NumThreads),
+		profiling:   state.Config.Profiling,
 	}
 	s.interpreter = i
 	s.LoadSingletons(state)
@@ -47,11 +53,11 @@ func (i *interpreter) LoadBuiltins(filename string, contents []byte, statements 
 	// Gentle hack - attach the native code once we have loaded the correct file.
 	// Needs to be after this file is loaded but before any of the others that will
 	// use functions from it.
-	if filename == "builtins.build_defs" || filename == "rules/builtins.build_defs" {
+	if filename == "builtins.build_defs" {
 		defer registerBuiltins(s)
-	} else if filename == "misc_rules.build_defs" || filename == "rules/misc_rules.build_defs" {
+	} else if filename == "misc_rules.build_defs" {
 		defer registerSubincludePackage(s)
-	} else if filename == "config_rules.build_defs" || filename == "rules/config_rules.build_defs" {
+	} else if filename == "config_rules.build_defs" {
 		defer setNativeCode(s, "select", selectFunc)
 	}
 	defer i.scope.SetAll(s.Freeze(), true)
@@ -60,6 +66,12 @@ func (i *interpreter) LoadBuiltins(filename string, contents []byte, statements 
 		return err
 	} else if len(contents) != 0 {
 		stmts, err := i.parser.ParseData(contents, filename)
+		for _, stmt := range stmts {
+			if stmt.FuncDef != nil {
+				stmt.FuncDef.KeywordsOnly = !whitelistedKwargs(stmt.FuncDef.Name, filename)
+				stmt.FuncDef.IsBuiltin = true
+			}
+		}
 		return i.loadBuiltinStatements(s, stmts, err)
 	}
 	stmts, err := i.parser.parse(filename)
@@ -79,7 +91,7 @@ func (i *interpreter) loadBuiltinStatements(s *scope, statements []*Statement, e
 // interpretAll runs a series of statements in the context of the given package.
 // The first return value is for testing only.
 func (i *interpreter) interpretAll(pkg *core.Package, statements []*Statement) (s *scope, err error) {
-	s = i.scope.NewPackagedScope(pkg)
+	s = i.scope.NewPackagedScope(pkg, 1)
 	// Config needs a little separate tweaking.
 	// Annoyingly we'd like to not have to do this at all, but it's very hard to handle
 	// mutating operations like .setdefault() otherwise.
@@ -101,7 +113,7 @@ func (i *interpreter) interpretStatements(s *scope, statements []*Statement) (re
 			} else {
 				err = fmt.Errorf("%s", r)
 			}
-			log.Debug("%v", debug.Stack())
+			log.Debug("%s", debug.Stack())
 		}
 	}()
 	return s.interpretStatements(statements), nil // Would have panicked if there was an error
@@ -189,12 +201,14 @@ func (i *interpreter) optimiseExpressions(stmts []*Statement) {
 
 // A scope contains all the information about a lexical scope.
 type scope struct {
+	ctx         context.Context
 	interpreter *interpreter
 	state       *core.BuildState
 	pkg         *core.Package
 	parent      *scope
 	locals      pyDict
 	config      *pyConfig
+	globber     *fs.Globber
 	// True if this scope is for a pre- or post-build callback.
 	Callback bool
 
@@ -206,18 +220,20 @@ type scope struct {
 
 // NewScope creates a new child scope of this one.
 func (s *scope) NewScope() *scope {
-	return s.NewPackagedScope(s.pkg)
+	return s.NewPackagedScope(s.pkg, 0)
 }
 
 // NewPackagedScope creates a new child scope of this one pointing to the given package.
-func (s *scope) NewPackagedScope(pkg *core.Package) *scope {
+// hint is a size hint for the new set of locals.
+func (s *scope) NewPackagedScope(pkg *core.Package, hint int) *scope {
 	s2 := &scope{
+		ctx:         s.ctx,
 		interpreter: s.interpreter,
 		state:       s.state,
 		pkg:         pkg,
 		contextPkg:  pkg,
 		parent:      s,
-		locals:      pyDict{},
+		locals:      make(pyDict, hint),
 		config:      s.config,
 		Callback:    s.Callback,
 	}
@@ -347,9 +363,10 @@ func (s *scope) interpretStatements(statements []*Statement) pyObject {
 				}
 			}
 		} else if stmt.Raise != nil {
+			log.Warning("The raise keyword is deprecated, please use fail() instead. See https://github.com/thought-machine/please/issues/1598 for more information.")
 			s.Error(s.interpretExpression(stmt.Raise).String())
 		} else if stmt.Literal != nil {
-			// Do nothing, literal statements are likely docstrings and don't require any action.
+			s.interpretExpression(stmt.Literal)
 		} else if stmt.Continue {
 			// This is definitely awkward since we need to control a for loop that's happening in a function outside this scope.
 			return continueIteration
@@ -496,10 +513,14 @@ func (s *scope) interpretValueExpressionPart(expr *ValueExpression) pyObject {
 		return pyString(stringLiteral(expr.String))
 	} else if expr.FString != nil {
 		return s.interpretFString(expr.FString)
-	} else if expr.Int != nil {
-		return pyInt(expr.Int.Int)
-	} else if expr.Bool != "" {
-		return s.Lookup(expr.Bool)
+	} else if expr.IsInt {
+		return pyInt(expr.Int)
+	} else if expr.True {
+		return True
+	} else if expr.False {
+		return False
+	} else if expr.None {
+		return None
 	} else if expr.List != nil {
 		return s.interpretList(expr.List)
 	} else if expr.Dict != nil {
@@ -527,14 +548,21 @@ func (s *scope) interpretValueExpressionPart(expr *ValueExpression) pyObject {
 }
 
 func (s *scope) interpretFString(f *FString) pyObject {
+	stringVar := func(v FStringVar) string {
+		if v.Config != "" {
+			return s.config.MustGet(v.Config).String()
+		}
+		return s.Lookup(v.Var).String()
+	}
 	var b strings.Builder
+	size := len(f.Suffix)
+	for _, v := range f.Vars {
+		size += len(v.Prefix) + len(stringVar(v))
+	}
+	b.Grow(size)
 	for _, v := range f.Vars {
 		b.WriteString(v.Prefix)
-		if v.Config != "" {
-			b.WriteString(s.config.MustGet(v.Config).String())
-		} else {
-			b.WriteString(s.Lookup(v.Var).String())
-		}
+		b.WriteString(stringVar(v))
 	}
 	b.WriteString(f.Suffix)
 	return pyString(b.String())
@@ -724,7 +752,15 @@ func (s *scope) callObject(name string, obj pyObject, c *Call) pyObject {
 	if !ok {
 		s.Error("Non-callable object '%s' (is a %s)", name, obj.Type())
 	}
-	return f.Call(s, c)
+	if !s.interpreter.profiling {
+		return f.Call(s.ctx, s, c)
+	}
+	// If the CPU profiler is being run, attach the name of the current function in context.
+	var ret pyObject
+	pprof.Do(s.ctx, pprof.Labels("asp:func", f.name), func(ctx context.Context) {
+		ret = f.Call(ctx, s, c)
+	})
+	return ret
 }
 
 // Constant returns an object from an expression that describes a constant,
@@ -737,7 +773,7 @@ func (s *scope) Constant(expr *Expression) pyObject {
 		return expr.Optimised.Constant
 	} else if expr.Val == nil || len(expr.Val.Slices) != 0 || expr.Val.Property != nil || expr.Val.Call != nil || expr.Op != nil || expr.If != nil {
 		return nil
-	} else if expr.Val.Bool != "" || expr.Val.String != "" || expr.Val.Int != nil {
+	} else if expr.Val.True || expr.Val.False || expr.Val.None || expr.Val.IsInt || expr.Val.String != "" {
 		return s.interpretValueExpression(expr.Val)
 	} else if expr.Val.List != nil && expr.Val.List.Comprehension == nil {
 		// Lists can be constant if all their elements are also.

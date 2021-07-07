@@ -244,6 +244,7 @@ func ruleHash(state *core.BuildState, target *core.BuildTarget, runtime bool) []
 	hashBool(h, target.OutputIsComplete)
 	hashBool(h, target.Stamp)
 	hashBool(h, target.IsFilegroup)
+	hashBool(h, target.IsTextFile)
 	hashBool(h, target.IsRemoteFile)
 	hashBool(h, target.Local)
 	hashOptionalBool(h, target.ExitOnError)
@@ -278,12 +279,15 @@ func ruleHash(state *core.BuildState, target *core.BuildTarget, runtime bool) []
 		h.Write([]byte(o))
 	}
 
-	hashEntryPoints(h, target.EntryPoints)
+	hashMap(h, target.EntryPoints)
+	hashMap(h, target.Env)
+
+	h.Write([]byte(target.FileContent))
 
 	return h.Sum(nil)
 }
 
-func hashEntryPoints(writer hash.Hash, eps map[string]string) {
+func hashMap(writer hash.Hash, eps map[string]string) {
 	keys := make([]string, len(eps))
 	for ep := range eps {
 		keys = append(keys, ep)
@@ -466,7 +470,7 @@ func RuntimeHash(state *core.BuildState, target *core.BuildTarget, testRun int) 
 	hash := append(RuleHash(state, target, true, false), RuleHash(state, target, true, true)...)
 	hash = append(hash, state.Hashes.Config...)
 	h := sha1.New()
-	for source := range core.IterRuntimeFiles(state.Graph, target, true, testRun) {
+	for source := range core.IterRuntimeFiles(state.Graph, target, true, target.TestDir(testRun)) {
 		result, err := state.PathHasher.Hash(source.Src, false, true)
 		if err != nil {
 			return result, err
@@ -494,8 +498,8 @@ func PrintHashes(state *core.BuildState, target *core.BuildTarget) {
 		fmt.Printf("  Source: %s: %s\n", source.Src, b64(state.PathHasher.MustHash(source.Src)))
 	}
 	for _, tool := range target.AllTools() {
-		if label := tool.Label(); label != nil {
-			fmt.Printf("    Tool: %s: %s\n", *label, b64(mustShortTargetHash(state, state.Graph.TargetOrDie(*label))))
+		if label, ok := tool.Label(); ok {
+			fmt.Printf("    Tool: %s: %s\n", label, b64(mustShortTargetHash(state, state.Graph.TargetOrDie(label))))
 		} else {
 			fmt.Printf("    Tool: %s: %s\n", tool, b64(state.PathHasher.MustHash(tool.FullPaths(state.Graph)[0])))
 		}

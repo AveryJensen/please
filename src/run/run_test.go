@@ -2,7 +2,6 @@ package run
 
 import (
 	"context"
-	"github.com/thought-machine/please/src/cli"
 	"os"
 	"testing"
 
@@ -19,17 +18,17 @@ func init() {
 
 func TestSequential(t *testing.T) {
 	state, labels1, labels2 := makeState(core.DefaultConfiguration())
-	code := Sequential(state, labels1, nil, true, false, false, "", cli.Arch{})
+	code := Sequential(state, labels1, nil, true, false, false, false, "")
 	assert.Equal(t, 0, code)
-	code = Sequential(state, labels2, nil, false, false, false, "", cli.Arch{})
+	code = Sequential(state, labels2, nil, false, false, false, false, "")
 	assert.Equal(t, 1, code)
 }
 
 func TestParallel(t *testing.T) {
 	state, labels1, labels2 := makeState(core.DefaultConfiguration())
-	code := Parallel(context.Background(), state, labels1, nil, 5, false, false, false, false, "", cli.Arch{})
+	code := Parallel(context.Background(), state, labels1, nil, 5, Default, false, false, false, false, "")
 	assert.Equal(t, 0, code)
-	code = Parallel(context.Background(), state, labels2, nil, 5, true, false, false, false, "", cli.Arch{})
+	code = Parallel(context.Background(), state, labels2, nil, 5, Quiet, false, false, false, false, "")
 	assert.Equal(t, 1, code)
 }
 
@@ -39,10 +38,10 @@ func TestEnvVars(t *testing.T) {
 	state, lab1, _ := makeState(config)
 
 	os.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
-	env := environ(state, state.Graph.TargetOrDie(lab1[0].BuildLabel), false)
+	env := environ(state, state.Graph.TargetOrDie(lab1[0].BuildLabel), false, false)
 	assert.Contains(t, env, "PATH=/usr/local/bin:/usr/bin:/bin")
 	assert.NotContains(t, env, "PATH=/wibble")
-	env = environ(state, state.Graph.TargetOrDie(lab1[0].BuildLabel), true)
+	env = environ(state, state.Graph.TargetOrDie(lab1[0].BuildLabel), true, false)
 	assert.NotContains(t, env, "PATH=/usr/local/bin:/usr/bin:/bin")
 	assert.Contains(t, env, "PATH=:/wibble", env)
 }

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -97,10 +96,7 @@ func MonitorState(ctx context.Context, state *core.BuildState, plainOutput, deta
 		} else if (state.NeedHashesOnly || state.PrepareOnly || state.PrepareShell) && target.State() == core.Stopped {
 			// Do nothing, we will output about this shortly.
 		} else if state.NeedBuild && target.State() < core.Built && len(failedTargetMap) == 0 && !target.AddedPostBuild {
-			// N.B. Currently targets that are added post-build are excluded here, because in some legit cases this
-			//      check can fail incorrectly. It'd be better to verify this more precisely though.
-			cycle := graphCycleMessage(state.Graph, target)
-			log.Fatalf("Target %s hasn't built but we have no pending tasks left.\n%s", label, cycle)
+			log.Fatalf("Target %s hasn't built but we have no pending tasks left.\n%s", label, unbuiltTargetsMessage(state.Graph))
 		}
 	}
 	if state.NeedBuild && len(failedNonTests) == 0 {
@@ -208,7 +204,7 @@ func processResult(state *core.BuildState, result *core.BuildResult, buildingTar
 		}
 	}
 	if streamTestResults && (result.Status == core.TargetTested || result.Status == core.TargetTestFailed) {
-		os.Stdout.Write(test.SerialiseResultsToXML(target, false))
+		os.Stdout.Write(test.SerialiseResultsToXML(target, false, state.Config.Test.StoreTestOutputOnSuccess))
 		os.Stdout.Write([]byte{'\n'})
 	}
 }
@@ -489,16 +485,18 @@ func printHashes(state *core.BuildState, duration time.Duration) {
 
 func printTempDirs(state *core.BuildState, duration time.Duration) {
 	fmt.Printf("Temp directories prepared, total time %s:\n", duration)
-	state = state.ForArch(state.OriginalArch)
+	state = state.ForArch(state.TargetArch)
 	for _, label := range state.ExpandVisibleOriginalTargets() {
 		target := state.Graph.TargetOrDie(label)
 		cmd := target.GetCommand(state)
 		dir := target.TmpDir()
-		env := core.StampedBuildEnvironment(state, target, nil, path.Join(core.RepoRoot, target.TmpDir()))
+		env := core.StampedBuildEnvironment(state, target, nil, path.Join(core.RepoRoot, target.TmpDir()), target.Stamp)
+		shouldSandbox := target.Sandbox
 		if state.NeedTests {
 			cmd = target.GetTestCommand(state)
 			dir = path.Join(core.RepoRoot, target.TestDir(1))
 			env = core.TestEnvironment(state, target, dir)
+			shouldSandbox = target.TestSandbox
 		}
 		cmd, _ = core.ReplaceSequences(state, target, cmd)
 		env = append(env, "CMD="+cmd)
@@ -510,16 +508,15 @@ func printTempDirs(state *core.BuildState, duration time.Duration) {
 		} else {
 			fmt.Printf("\n")
 			argv := []string{"bash", "--noprofile", "--norc", "-o", "pipefail"}
-			if (state.NeedTests && target.TestSandbox) || (!state.NeedTests && target.Sandbox) {
-				argv = state.ProcessExecutor.MustSandboxCommand(argv)
-			}
 			log.Debug("Full command: %s", strings.Join(argv, " "))
-			cmd := exec.Command(argv[0], argv[1:]...)
+			cmd := state.ProcessExecutor.ExecCommand(shouldSandbox, argv[0], argv[1:]...)
 			cmd.Dir = dir
 			cmd.Env = env
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
+			// TODO(jpoole): Read the docs. Attaching stdin and out doesn't seem to work with this.
+			cmd.SysProcAttr.Setpgid = false
 			cmd.Run() // Ignore errors, it will typically end by the user killing it somehow.
 		}
 	}
@@ -745,62 +742,12 @@ func colouriseError(err error) error {
 // errorMessageRe is a regex to find lines that look like they're specifying a file.
 var errorMessageRe = regexp.MustCompile(`^([^ ]+\.[^: /]+):([0-9]+):(?:([0-9]+):)? *(?:([a-z-_ ]+):)? (.*)$`)
 
-// graphCycleMessage attempts to detect graph cycles and produces a readable message from it.
-func graphCycleMessage(graph *core.BuildGraph, target *core.BuildTarget) string {
-	if cycle := findGraphCycle(graph, target); len(cycle) > 0 {
-		msg := "Dependency cycle found:\n"
-		msg += fmt.Sprintf("    %s\n", cycle[len(cycle)-1].Label)
-		for i := len(cycle) - 2; i >= 0; i-- {
-			msg += fmt.Sprintf(" -> %s\n", cycle[i].Label)
-		}
-		msg += fmt.Sprintf(" -> %s\n", cycle[len(cycle)-1].Label)
-		return msg + "Sorry, but you'll have to refactor your build files to avoid this cycle."
-	}
-	return unbuiltTargetsMessage(graph)
-}
-
-// Attempts to detect cycles in the build graph. Returns an empty slice if none is found,
-// otherwise returns a slice of labels describing the cycle.
-func findGraphCycle(graph *core.BuildGraph, target *core.BuildTarget) []*core.BuildTarget {
-	index := func(haystack []*core.BuildTarget, needle *core.BuildTarget) int {
-		for i, straw := range haystack {
-			if straw == needle {
-				return i
-			}
-		}
-		return -1
-	}
-
-	done := map[core.BuildLabel]bool{}
-	var detectCycle func(*core.BuildTarget, []*core.BuildTarget) []*core.BuildTarget
-	detectCycle = func(target *core.BuildTarget, deps []*core.BuildTarget) []*core.BuildTarget {
-		if i := index(deps, target); i != -1 {
-			return deps[i:]
-		} else if done[target.Label] {
-			return nil
-		}
-		done[target.Label] = true
-		deps = append(deps, target)
-		for _, dep := range target.Dependencies() {
-			if cycle := detectCycle(dep, deps); len(cycle) > 0 {
-				return cycle
-			}
-		}
-		return nil
-	}
-	return detectCycle(target, nil)
-}
-
 // unbuiltTargetsMessage returns a message for any targets that are supposed to build but haven't yet.
 func unbuiltTargetsMessage(graph *core.BuildGraph) string {
 	msg := ""
 	for _, target := range graph.AllTargets() {
 		if target.State() == core.Active {
-			if graph.AllDepsBuilt(target) {
-				msg += fmt.Sprintf("  %s (all deps have built)\n", target.Label)
-			} else {
-				msg += fmt.Sprintf("  %s\n", target.Label)
-			}
+			msg += fmt.Sprintf("  %s", target.Label)
 		} else if target.State() == core.Pending {
 			msg += fmt.Sprintf("  %s (pending build)\n", target.Label)
 		}

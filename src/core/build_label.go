@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -41,6 +42,10 @@ var OriginalTarget = BuildLabel{PackageName: "", Name: "_ORIGINAL"}
 
 // String returns a string representation of this build label.
 func (label BuildLabel) String() string {
+	zero := BuildLabel{}
+	if label == zero {
+		return ""
+	}
 	s := "//" + label.PackageName
 	if label.Subrepo != "" {
 		s = "///" + label.Subrepo + s
@@ -201,6 +206,9 @@ func parseBuildLabelSubrepo(target, currentPath string) (string, string, string)
 			return "", target, target
 		}
 	}
+	if strings.ContainsRune(target[:idx], ':') {
+		return "", "", ""
+	}
 	pkg, name, _ := parseBuildLabelParts(target[idx:], currentPath, "")
 	return pkg, name, target[:idx]
 }
@@ -303,12 +311,12 @@ func (label BuildLabel) LocalPaths(graph *BuildGraph) []string {
 }
 
 // Label is an implementation of BuildInput interface. It always returns this label.
-func (label BuildLabel) Label() *BuildLabel {
-	return &label
+func (label BuildLabel) Label() (BuildLabel, bool) {
+	return label, true
 }
 
-func (label BuildLabel) nonOutputLabel() *BuildLabel {
-	return &label
+func (label BuildLabel) nonOutputLabel() (BuildLabel, bool) {
+	return label, true
 }
 
 // UnmarshalFlag unmarshals a build label from a command line flag. Implementation of flags.Unmarshaler interface.
@@ -350,6 +358,11 @@ func (label BuildLabel) Parent() BuildLabel {
 	return label
 }
 
+// IsHidden return whether the target is an intermediate target created by the build definition.
+func (label BuildLabel) IsHidden() bool {
+	return label.Name[0] == '_'
+}
+
 // HasParent returns true if the build label has a parent that's not itself.
 func (label BuildLabel) HasParent() bool {
 	return label.Parent() != label
@@ -377,6 +390,11 @@ func (label BuildLabel) SubrepoLabel() BuildLabel {
 	}
 	// This is legit, the subrepo is defined at the root.
 	return BuildLabel{Name: label.Subrepo}
+}
+
+// packageKey returns a key for this build label that only uses the subrepo and package parts.
+func (label BuildLabel) packageKey() packageKey {
+	return packageKey{Name: label.PackageName, Subrepo: label.Subrepo}
 }
 
 // CanSee returns true if label can see the given dependency, or false if not.
@@ -426,7 +444,7 @@ func (label BuildLabel) Complete(match string) []flags.Completion {
 	os.Setenv("PLZ_COMPLETE", match)
 	os.Unsetenv("GO_FLAGS_COMPLETION")
 	exec, _ := os.Executable()
-	out, _, err := process.New("").ExecWithTimeout(nil, "", os.Environ(), 10*time.Second, false, false, false, append([]string{exec}, os.Args[1:]...))
+	out, _, err := process.New().ExecWithTimeout(context.Background(), nil, "", os.Environ(), 10*time.Second, false, false, false, false, append([]string{exec}, os.Args[1:]...))
 	if err != nil {
 		return nil
 	}
@@ -477,4 +495,11 @@ func (slice BuildLabels) Less(i, j int) bool {
 }
 func (slice BuildLabels) Swap(i, j int) {
 	slice[i], slice[j] = slice[j], slice[i]
+}
+func (slice BuildLabels) String() string {
+	s := make([]string, len(slice))
+	for i, l := range slice {
+		s[i] = l.String()
+	}
+	return strings.Join(s, ", ")
 }

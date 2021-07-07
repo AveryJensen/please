@@ -9,6 +9,8 @@ import (
 	"path"
 	"syscall"
 
+	"github.com/thought-machine/please/src/process"
+
 	"gopkg.in/op/go-logging.v1"
 )
 
@@ -178,5 +180,21 @@ func copyFile(from, to string) (err error) {
 		return err
 	}
 
+	return nil
+}
+
+// ForceRemove will try and remove the path with `os.RemoveAll`, and if that fails, it will use `rm -rf` running the
+// command in any namespace that please is configured to.
+func ForceRemove(exec *process.Executor, path string) error {
+	// Try and remove it normally first
+	if err := os.RemoveAll(path); err == nil || os.IsNotExist(err) {
+		return nil
+	}
+
+	cmd := exec.ExecCommand(false, "rm", "-rf", path)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to remove %s: %w\nOutput: %s", path, err, string(out))
+	}
 	return nil
 }

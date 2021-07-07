@@ -8,6 +8,7 @@ go_library(
     deps = [
         "//src/core",
         "//src/fs",
+        "//src/process",
         "//src/worker",
         "//third_party/go:go-multierror",
         "//third_party/go:logging",
@@ -32,7 +33,6 @@ go_test(
         ":build",
         "//src/core",
         "//src/fs",
-        "//src/output",
         "//third_party/go:testify",
     ],
 )

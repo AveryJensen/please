@@ -7,6 +7,8 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"github.com/thought-machine/please/src/format"
 	"github.com/thought-machine/please/src/fs"
 	"github.com/thought-machine/please/src/gc"
+	"github.com/thought-machine/please/src/generate"
 	"github.com/thought-machine/please/src/hashes"
 	"github.com/thought-machine/please/src/help"
 	"github.com/thought-machine/please/src/output"
@@ -32,6 +35,7 @@ import (
 	"github.com/thought-machine/please/src/plzinit"
 	"github.com/thought-machine/please/src/query"
 	"github.com/thought-machine/please/src/run"
+	"github.com/thought-machine/please/src/sandbox"
 	"github.com/thought-machine/please/src/scm"
 	"github.com/thought-machine/please/src/test"
 	"github.com/thought-machine/please/src/tool"
@@ -48,15 +52,15 @@ var config *core.Configuration
 var opts struct {
 	Usage      string `usage:"Please is a high-performance multi-language build system.\n\nIt uses BUILD files to describe what to build and how to build it.\nSee https://please.build for more information about how it works and what Please can do for you."`
 	BuildFlags struct {
-		Config     string              `short:"c" long:"config" env:"PLZ_BUILD_CONFIG" description:"Build config to use. Defaults to opt."`
-		Arch       cli.Arch            `short:"a" long:"arch" description:"Architecture to compile for."`
-		RepoRoot   cli.Filepath        `short:"r" long:"repo_root" description:"Root of repository to build."`
-		NumThreads int                 `short:"n" long:"num_threads" description:"Number of concurrent build operations. Default is number of CPUs + 2."`
-		Include    []string            `short:"i" long:"include" description:"Label of targets to include in automatic detection."`
-		Exclude    []string            `short:"e" long:"exclude" description:"Label of targets to exclude from automatic detection."`
-		Option     ConfigOverrides     `short:"o" long:"override" env:"PLZ_OVERRIDES" env-delim:";" description:"Options to override from .plzconfig (e.g. -o please.selfupdate:false)"`
-		Profile    core.ConfigProfiles `long:"profile" env:"PLZ_CONFIG_PROFILE" description:"Configuration profile to load; e.g. --profile=dev will load .plzconfig.dev if it exists."`
-		PreTargets []core.BuildLabel   `long:"pre" hidden:"true" description:"Targets to build before the other command-line ones. Sometimes useful to debug targets generated as part of a post-build function."`
+		Config     string               `short:"c" long:"config" env:"PLZ_BUILD_CONFIG" description:"Build config to use. Defaults to opt."`
+		Arch       cli.Arch             `short:"a" long:"arch" description:"Architecture to compile for."`
+		RepoRoot   cli.Filepath         `short:"r" long:"repo_root" description:"Root of repository to build."`
+		NumThreads int                  `short:"n" long:"num_threads" description:"Number of concurrent build operations. Default is number of CPUs + 2."`
+		Include    []string             `short:"i" long:"include" description:"Label of targets to include in automatic detection."`
+		Exclude    []string             `short:"e" long:"exclude" description:"Label of targets to exclude from automatic detection."`
+		Option     ConfigOverrides      `short:"o" long:"override" env:"PLZ_OVERRIDES" env-delim:";" description:"Options to override from .plzconfig (e.g. -o please.selfupdate:false)"`
+		Profile    []core.ConfigProfile `long:"profile" env:"PLZ_CONFIG_PROFILE" env-delim:";" description:"Configuration profile to load; e.g. --profile=dev will load .plzconfig.dev if it exists."`
+		PreTargets []core.BuildLabel    `long:"pre" hidden:"true" description:"Targets to build before the other command-line ones. Sometimes useful to debug targets generated as part of a post-build function."`
 	} `group:"Options controlling what to build & how to build it"`
 
 	OutputFlags struct {
@@ -75,7 +79,6 @@ var opts struct {
 
 	FeatureFlags struct {
 		NoUpdate           bool    `long:"noupdate" description:"Disable Please attempting to auto-update itself."`
-		NoCache            bool    `long:"nocache" description:"Deprecated, use plz build --rebuild or plz test --rerun flags instead."`
 		NoHashVerification bool    `long:"nohash_verification" description:"Hash verification errors are nonfatal."`
 		NoLock             bool    `long:"nolock" description:"Don't attempt to lock the repo exclusively. Use with care."`
 		KeepWorkdirs       bool    `long:"keep_workdirs" description:"Don't clean directories in plz-out/tmp after successfully building targets."`
@@ -89,17 +92,18 @@ var opts struct {
 
 	Profile          string `long:"profile_file" hidden:"true" description:"Write profiling output to this file"`
 	MemProfile       string `long:"mem_profile_file" hidden:"true" description:"Write a memory profile to this file"`
+	MutexProfile     string `long:"mutex_profile_file" hidden:"true" description:"Write a contended mutex profile to this file"`
 	ProfilePort      int    `long:"profile_port" hidden:"true" description:"Serve profiling info on this port."`
 	ParsePackageOnly bool   `description:"Parses a single package only. All that's necessary for some commands." no-flag:"true"`
 	Complete         string `long:"complete" hidden:"true" env:"PLZ_COMPLETE" description:"Provide completion options for this build target."`
 
 	Build struct {
-		Prepare    bool     `long:"prepare" description:"Prepare build directory for these targets but don't build them."`
-		Shell      bool     `long:"shell" description:"Like --prepare, but opens a shell in the build directory with the appropriate environment variables."`
-		Rebuild    bool     `long:"rebuild" description:"To force the optimisation and rebuild one or more targets."`
-		NoDownload bool     `long:"nodownload" hidden:"true" description:"Don't download outputs after building. Only applies when using remote build execution."`
-		Download   bool     `long:"download" hidden:"true" description:"Force download of all outputs regardless of original target spec. Only applies when using remote build execution."`
-		Args       struct { // Inner nesting is necessary to make positional-args work :(
+		Prepare    bool `long:"prepare" description:"Prepare build directory for these targets but don't build them."`
+		Shell      bool `long:"shell" description:"Like --prepare, but opens a shell in the build directory with the appropriate environment variables."`
+		Rebuild    bool `long:"rebuild" description:"To force the optimisation and rebuild one or more targets."`
+		NoDownload bool `long:"nodownload" hidden:"true" description:"Don't download outputs after building. Only applies when using remote build execution."`
+		Download   bool `long:"download" hidden:"true" description:"Force download of all outputs regardless of original target spec. Only applies when using remote build execution."`
+		Args       struct {
 			Targets []core.BuildLabel `positional-arg-name:"targets" description:"Targets to build"`
 		} `positional-args:"true" required:"true"`
 	} `command:"build" description:"Builds one or more targets"`
@@ -163,10 +167,13 @@ var opts struct {
 		Env        bool   `long:"env" description:"Overrides environment variables (e.g. PATH) in the new process."`
 		Rebuild    bool   `long:"rebuild" description:"To force the optimisation and rebuild one or more targets."`
 		InWD       bool   `long:"in_wd" description:"When running locally, stay in the original working directory."`
+		InTempDir  bool   `long:"in_tmp_dir" description:"Runs in a temp directory, setting env variables and copying in runtime data similar to tests."`
 		EntryPoint string `long:"entry_point" short:"e" description:"The entry point of the target to use." default:""`
+		Cmd        string `long:"cmd" description:"Overrides the command to be run. This is useful when the initial command needs to be wrapped in another one." default:""`
 		Parallel   struct {
-			NumTasks       int  `short:"n" long:"num_tasks" default:"10" description:"Maximum number of subtasks to run in parallel"`
-			Quiet          bool `short:"q" long:"quiet" description:"Suppress output from successful subprocesses."`
+			NumTasks       int                `short:"n" long:"num_tasks" default:"10" description:"Maximum number of subtasks to run in parallel"`
+			Quiet          bool               `short:"q" long:"quiet" description:"Deprecated in favour of --output=quiet. Suppress output from successful subprocesses."`
+			Output         run.ParallelOutput `long:"output" default:"default" choice:"default" choice:"quiet" choice:"group_immediate" description:"Allows to control how the output should be handled."`
 			PositionalArgs struct {
 				Targets []core.AnnotatedOutputLabel `positional-arg-name:"target" description:"Targets to run"`
 			} `positional-args:"true" required:"true"`
@@ -202,10 +209,11 @@ var opts struct {
 	} `command:"watch" description:"Watches sources of targets for changes and rebuilds them"`
 
 	Update struct {
-		Force    bool        `long:"force" description:"Forces a re-download of the new version."`
-		NoVerify bool        `long:"noverify" description:"Skips signature verification of downloaded version"`
-		Latest   bool        `long:"latest" description:"Update to latest available version (overrides config)."`
-		Version  cli.Version `long:"version" description:"Updates to a particular version (overrides config)."`
+		Force            bool        `long:"force" description:"Forces a re-download of the new version."`
+		NoVerify         bool        `long:"noverify" description:"Skips signature verification of downloaded version"`
+		Latest           bool        `long:"latest" description:"Update to latest available version (overrides config)."`
+		LatestPrerelease bool        `long:"latest_prerelease" description:"Update to latest available prerelease version (overrides config)."`
+		Version          cli.Version `long:"version" description:"Updates to a particular version (overrides config)."`
 	} `command:"update" description:"Checks for an update and updates if needed."`
 
 	Op struct {
@@ -221,7 +229,7 @@ var opts struct {
 			Args  struct {
 				Options ConfigOverrides `positional-arg-name:"config" required:"true" description:"Attributes to set"`
 			} `positional-args:"true" required:"true"`
-		} `command:"config" description:"Initialises specific attributes of config files"`
+		} `command:"config" description:"Initialises specific attributes of config files. Warning, will add duplicate entries if attribute already set"`
 		Pleasings struct {
 			Revision  string `short:"r" long:"revision" description:"The revision to pin the pleasings repo to. This can be a branch, commit, tag, or other git reference."`
 			Location  string `short:"l" long:"location" description:"The location of the build file to write the subrepo rule to" default:"BUILD"`
@@ -333,6 +341,13 @@ var opts struct {
 				Targets []core.BuildLabel `positional-arg-name:"targets" description:"Targets to render graph for"`
 			} `positional-args:"true"`
 		} `command:"graph" description:"Prints a JSON representation of the build graph."`
+		WhatInputs struct {
+			Hidden    bool `long:"hidden" short:"h" description:"Output internal / hidden targets too."`
+			EchoFiles bool `long:"echo_files" description:"Echo the file for which the printed output is responsible."`
+			Args      struct {
+				Files cli.StdinStrings `positional-arg-name:"files" description:"Files to query as sources to targets" required:"true"`
+			} `positional-args:"true" required:"true"`
+		} `command:"whatinputs" description:"Prints out target(s) with provided file(s) as inputs"`
 		WhatOutputs struct {
 			EchoFiles bool `long:"echo_files" description:"Echo the file for which the printed output is responsible."`
 			Args      struct {
@@ -346,7 +361,8 @@ var opts struct {
 		} `command:"rules" description:"Prints built-in rules to stdout as JSON"`
 		Changes struct {
 			Since            string `short:"s" long:"since" default:"origin/master" description:"Revision to compare against"`
-			IncludeDependees string `long:"include_dependees" default:"none" choice:"none" choice:"direct" choice:"transitive" description:"Include direct or transitive dependees of changed targets."`
+			IncludeDependees string `long:"include_dependees" default:"none" choice:"none" choice:"direct" choice:"transitive" description:"Deprecated: use level 1 for direct and -1 for transitive. Include direct or transitive dependees of changed targets."`
+			Level            int    `long:"level" default:"-2" description:"Levels of the dependencies of changed targets (-1 for unlimited)." default-mask:"0"`
 			Inexact          bool   `long:"inexact" description:"Calculate changes more quickly and without doing any SCM checkouts, but may miss some targets."`
 			In               string `long:"in" description:"Calculate changes contained within given scm spec (commit range/sha/ref/etc). Implies --inexact."`
 			Args             struct {
@@ -366,6 +382,12 @@ var opts struct {
 			} `positional-args:"true"`
 		} `command:"filter" description:"Filter the given set of targets according to some rules"`
 	} `command:"query" description:"Queries information about the build graph"`
+	Codegen struct {
+		Gitignore string `long:"update_gitignore" description:"The gitignore file to write the generated sources to"`
+		Args      struct {
+			Targets []core.BuildLabel `positional-arg-name:"targets" description:"Targets to filter"`
+		} `positional-args:"true"`
+	} `command:"generate" description:"Builds all code generation targets in the repository and prints the generated files."`
 }
 
 // Definitions of what we do for each command.
@@ -376,6 +398,9 @@ var buildFunctions = map[string]func() int{
 		return toExitCode(success, state)
 	},
 	"hash": func() int {
+		if opts.Hash.Update {
+			opts.FeatureFlags.NoHashVerification = true
+		}
 		success, state := runBuild(opts.Hash.Args.Targets, true, false, false)
 		if success {
 			if opts.Hash.Detailed {
@@ -420,7 +445,7 @@ var buildFunctions = map[string]func() int{
 
 		if opts.Cover.LineCoverageReport {
 			output.PrintLineCoverageReport(state, opts.Cover.IncludeFile.AsStrings())
-		} else if !opts.Cover.NoCoverageReport {
+		} else if !opts.Cover.NoCoverageReport && !opts.Cover.Shell {
 			output.PrintCoverage(state, opts.Cover.IncludeFile.AsStrings())
 		}
 		if opts.Cover.Incremental {
@@ -439,7 +464,12 @@ var buildFunctions = map[string]func() int{
 				opts.Run.Args.Target.Annotation = opts.Run.EntryPoint
 			}
 
-			run.Run(state, opts.Run.Args.Target, opts.Run.Args.Args.AsStrings(), opts.Run.Remote, opts.Run.Env, dir, opts.BuildFlags.Arch)
+			annotatedOutputLabels := state.ExpandOriginalMaybeAnnotatedLabels([]core.AnnotatedOutputLabel{opts.Run.Args.Target})
+			if len(annotatedOutputLabels) != 1 {
+				log.Fatalf("%v expanded to more than one target. If you want to run multiple targets, use `plz run parallel %v` or `plz run sequential %v`. ", opts.Run.Args.Target, opts.Run.Args.Target, opts.Run.Args.Target)
+			}
+
+			run.Run(state, annotatedOutputLabels[0], opts.Run.Args.Args.AsStrings(), opts.Run.Remote, opts.Run.Env, opts.Run.InTempDir, dir, opts.Run.Cmd)
 		}
 		return 1 // We should never return from run.Run so if we make it here something's wrong.
 	},
@@ -449,8 +479,13 @@ var buildFunctions = map[string]func() int{
 			if opts.Run.InWD {
 				dir = originalWorkingDirectory
 			}
-
-			os.Exit(run.Parallel(context.Background(), state, opts.Run.Parallel.PositionalArgs.Targets, opts.Run.Parallel.Args.AsStrings(), opts.Run.Parallel.NumTasks, opts.Run.Parallel.Quiet, opts.Run.Remote, opts.Run.Env, opts.Run.Parallel.Detach, dir, opts.BuildFlags.Arch))
+			ls := state.ExpandOriginalMaybeAnnotatedLabels(opts.Run.Parallel.PositionalArgs.Targets)
+			output := opts.Run.Parallel.Output
+			if opts.Run.Parallel.Quiet {
+				log.Warningf("--quiet has been deprecated in favour of --output=quiet and will be removed in v17.")
+				output = run.Quiet
+			}
+			os.Exit(run.Parallel(context.Background(), state, ls, opts.Run.Parallel.Args.AsStrings(), opts.Run.Parallel.NumTasks, output, opts.Run.Remote, opts.Run.Env, opts.Run.Parallel.Detach, opts.Run.InTempDir, dir))
 		}
 		return 1
 	},
@@ -461,7 +496,8 @@ var buildFunctions = map[string]func() int{
 				dir = originalWorkingDirectory
 			}
 
-			os.Exit(run.Sequential(state, opts.Run.Sequential.PositionalArgs.Targets, opts.Run.Sequential.Args.AsStrings(), opts.Run.Sequential.Quiet, opts.Run.Remote, opts.Run.Env, dir, opts.BuildFlags.Arch))
+			ls := state.ExpandOriginalMaybeAnnotatedLabels(opts.Run.Sequential.PositionalArgs.Targets)
+			os.Exit(run.Sequential(state, ls, opts.Run.Sequential.Args.AsStrings(), opts.Run.Sequential.Quiet, opts.Run.Remote, opts.Run.Env, opts.Run.InTempDir, dir))
 		}
 		return 1
 	},
@@ -471,13 +507,13 @@ var buildFunctions = map[string]func() int{
 			if len(opts.BuildFlags.Include) == 0 && len(opts.BuildFlags.Exclude) == 0 {
 				// Clean everything, doesn't require parsing at all.
 				state := core.NewBuildState(config)
-				clean.Clean(config, newCache(state), !opts.Clean.NoBackground)
+				clean.Clean(config, cache.NewCache(state), !opts.Clean.NoBackground)
 				return 0
 			}
 			opts.Clean.Args.Targets = core.WholeGraph
 		}
 		if success, state := runBuild(opts.Clean.Args.Targets, false, false, false); success {
-			clean.Targets(state, state.ExpandOriginalLabels(), !opts.FeatureFlags.NoCache)
+			clean.Targets(state, state.ExpandOriginalLabels())
 			return 0
 		}
 		return 1
@@ -494,7 +530,7 @@ var buildFunctions = map[string]func() int{
 		if err == nil {
 			err = syscall.Exec(executable, append([]string{executable}, cmd...), os.Environ())
 		}
-		log.Fatalf("SORRY OP: %s", err) // On success Exec never returns.
+		log.Fatalf("SORRY OP: %s", err) // On success Run never returns.
 		return 1
 	},
 	"gc": func() int {
@@ -525,11 +561,6 @@ var buildFunctions = map[string]func() int{
 		fmt.Println("For more information visit https://github.com/thought-machine/pleasings")
 		fmt.Println()
 
-		if cli.PromptYN("Would you like to add pleasings to your project? You may also do this later with `plz init pleasings` if you wish.", true) {
-			if err := plzinit.InitPleasings("BUILD", false, "master"); err != nil {
-				log.Fatalf("failed to initialise pleasings in this repository: %v", err)
-			}
-		}
 		return 0
 	},
 	"config": func() int {
@@ -637,6 +668,18 @@ var buildFunctions = map[string]func() int{
 			query.Graph(state, state.ExpandLabels(targets))
 		})
 	},
+	"whatinputs": func() int {
+		files := opts.Query.WhatInputs.Args.Files.Get()
+		// We only need this to retrieve the BuildFileName
+		state := core.NewBuildState(config)
+		labels := make([]core.BuildLabel, 0, len(files))
+		for _, file := range files {
+			labels = append(labels, core.FindOwningPackage(state, file))
+		}
+		return runQuery(true, labels, func(state *core.BuildState) {
+			query.WhatInputs(state.Graph, files, opts.Query.WhatInputs.Hidden, opts.Query.WhatInputs.EchoFiles)
+		})
+	},
 	"whatoutputs": func() int {
 		return runQuery(true, core.WholeGraph, func(state *core.BuildState) {
 			query.WhatOutputs(state.Graph, opts.Query.WhatOutputs.Args.Files.Get(), opts.Query.WhatOutputs.EchoFiles)
@@ -649,12 +692,27 @@ var buildFunctions = map[string]func() int{
 	"changes": func() int {
 		// query changes always excludes 'manual' targets.
 		opts.BuildFlags.Exclude = append(opts.BuildFlags.Exclude, "manual", "manual:"+core.OsArch)
-
+		level := opts.Query.Changes.Level // -2 means unset -1 means all transitive
 		transitive := opts.Query.Changes.IncludeDependees == "transitive"
-		direct := opts.Query.Changes.IncludeDependees == "direct" || transitive
+		direct := opts.Query.Changes.IncludeDependees == "direct"
+		if transitive || direct {
+			log.Warning("include_dependees is deprecated. Please use level instead")
+		}
+		if (transitive || direct) && level != -2 {
+			log.Warning("Both level and include_dependees are set. Using the value from level")
+		}
+		switch {
+		// transitive subsumes direct so asses transitive first
+		case transitive && (level == -2):
+			level = -1
+		case direct && (level == -2):
+			level = 1
+		case level == -2:
+			level = 0
+		}
 		runInexact := func(files []string) int {
 			return runQuery(true, core.WholeGraph, func(state *core.BuildState) {
-				for _, target := range query.Changes(state, files, direct, transitive) {
+				for _, target := range query.Changes(state, files, level) {
 					fmt.Println(target.String())
 				}
 			})
@@ -685,7 +743,7 @@ var buildFunctions = map[string]func() int{
 		if !success {
 			return 1
 		}
-		for _, target := range query.DiffGraphs(before, after, files, direct, transitive) {
+		for _, target := range query.DiffGraphs(before, after, files, level) {
 			fmt.Println(target.String())
 		}
 		return 0
@@ -715,6 +773,49 @@ var buildFunctions = map[string]func() int{
 	},
 	"pleasew": func() int {
 		plzinit.InitWrapperScript()
+		return 0
+	},
+	"generate": func() int {
+		opts.BuildFlags.Include = append(opts.BuildFlags.Include, "codegen")
+
+		if opts.Codegen.Gitignore != "" {
+			pkg := filepath.Dir(opts.Codegen.Gitignore)
+			if pkg == "." {
+				pkg = ""
+			}
+			target := core.BuildLabel{
+				PackageName: pkg,
+				Name:        "...",
+			}
+
+			if len(opts.Codegen.Args.Targets) != 0 {
+				log.Warning("You've provided targets, and a gitignore to update. Ignoring the provided targets and building %v", target)
+			}
+
+			opts.Codegen.Args.Targets = []core.BuildLabel{target}
+		}
+
+		if success, state := runBuild(opts.Codegen.Args.Targets, true, false, true); success {
+			if opts.Codegen.Gitignore != "" {
+				err := generate.UpdateGitignore(state.Graph, state.ExpandOriginalLabels(), opts.Codegen.Gitignore)
+				if err != nil {
+					log.Fatalf("failed to update gitignore: %v", err)
+				}
+			}
+
+			// This may seem counter intuitive but if this was set, we would've linked during the build.
+			// If we've opted to not automatically link generated sources during the build, we should link them now.
+			if !state.Config.Build.LinkGeneratedSources {
+				generate.LinkGeneratedSources(state.Graph, state.ExpandOriginalLabels())
+			}
+			return 0
+		}
+		return 1
+	},
+	"sandbox": func() int {
+		if err := sandbox.Sandbox(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
 		return 0
 	},
 }
@@ -748,7 +849,7 @@ func doTest(targets []core.BuildLabel, surefireDir cli.Filepath, resultsFile cli
 	os.MkdirAll(string(surefireDir), core.DirPermissions)
 	success, state := runBuild(targets, true, true, false)
 	test.CopySurefireXMLFilesToDir(state, string(surefireDir))
-	test.WriteResultsToFileOrDie(state.Graph, string(resultsFile))
+	test.WriteResultsToFileOrDie(state.Graph, string(resultsFile), state.Config.Test.StoreTestOutputOnSuccess)
 	return success, state
 }
 
@@ -758,16 +859,6 @@ func prettyOutput(interactiveOutput bool, plainOutput bool, verbosity cli.Verbos
 		log.Fatal("Can't pass both --interactive_output and --plain_output")
 	}
 	return interactiveOutput || (!plainOutput && cli.StdErrIsATerminal && verbosity < 4)
-}
-
-// newCache constructs a new cache based on the current config / flags.
-func newCache(state *core.BuildState) core.Cache {
-	if opts.FeatureFlags.NoCache {
-		log.Warning("--nocache is deprecated, use plz build --rebuild or plz test --rerun instead")
-		log.Warning("See https://github.com/thought-machine/please/issues/1212 for more information")
-		return nil
-	}
-	return cache.NewCache(state)
 }
 
 // Please starts & runs the main build process through to its completion.
@@ -792,6 +883,9 @@ func Please(targets []core.BuildLabel, config *core.Configuration, shouldBuild, 
 	state.NeedTests = shouldTest
 	state.NeedRun = !opts.Run.Args.Target.IsEmpty() || len(opts.Run.Parallel.PositionalArgs.Targets) > 0 || len(opts.Run.Sequential.PositionalArgs.Targets) > 0
 	state.NeedHashesOnly = len(opts.Hash.Args.Targets) > 0
+	if opts.Build.Prepare {
+		log.Warningf("--prepare has been deprecated in favour of --shell and will be removed in v17.")
+	}
 	state.PrepareOnly = opts.Build.Prepare || opts.Build.Shell
 	state.PrepareShell = opts.Build.Shell || opts.Test.Shell || opts.Cover.Shell
 	state.Watch = len(opts.Watch.Args.Targets) > 0
@@ -805,30 +899,38 @@ func Please(targets []core.BuildLabel, config *core.Configuration, shouldBuild, 
 	state.DownloadOutputs = (!opts.Build.NoDownload && !opts.Run.Remote && len(targets) > 0 && (!targets[0].IsAllSubpackages() || len(opts.BuildFlags.Include) > 0)) || opts.Build.Download
 	state.SetIncludeAndExclude(opts.BuildFlags.Include, opts.BuildFlags.Exclude)
 	if opts.BuildFlags.Arch.OS != "" {
-		state.OriginalArch = opts.BuildFlags.Arch
+		state.TargetArch = opts.BuildFlags.Arch
 	}
 
 	if state.DebugTests && len(targets) != 1 {
 		log.Fatalf("-d/--debug flag can only be used with a single test target")
 	}
 
+	if opts.Run.InTempDir && opts.Run.InWD {
+		log.Fatal("Can't use both --in_temp_dir and --in_wd at the same time")
+	}
+
 	runPlease(state, targets)
+	if state.RemoteClient != nil && !opts.Run.Remote {
+		defer state.RemoteClient.Disconnect()
+	}
 	return state.Successful(), state
 }
 
 func runPlease(state *core.BuildState, targets []core.BuildLabel) {
 	// Acquire the lock before we start building
 	if (state.NeedBuild || state.NeedTests) && !opts.FeatureFlags.NoLock {
-		core.AcquireRepoLock(state)
+		core.AcquireRepoLock()
 		defer core.ReleaseRepoLock()
 	}
+	core.CheckXattrsSupported(state)
 
 	detailedTests := state.NeedTests && (opts.Test.Detailed || opts.Cover.Detailed ||
 		(len(targets) == 1 && !targets[0].IsAllTargets() &&
 			!targets[0].IsAllSubpackages() && targets[0] != core.BuildLabelStdin))
 	streamTests := opts.Test.StreamResults || opts.Cover.StreamResults
 	pretty := prettyOutput(opts.OutputFlags.InteractiveOutput, opts.OutputFlags.PlainOutput, opts.OutputFlags.Verbosity) && state.NeedBuild && !streamTests
-	state.Cache = newCache(state)
+	state.Cache = cache.NewCache(state)
 
 	// Run the display
 	state.Results() // important this is called now, don't ask...
@@ -839,7 +941,7 @@ func runPlease(state *core.BuildState, targets []core.BuildLabel) {
 		output.MonitorState(ctx, state, !pretty, detailedTests, streamTests, string(opts.OutputFlags.TraceFile))
 		wg.Done()
 	}()
-	plz.Run(targets, opts.BuildFlags.PreTargets, state, config, opts.BuildFlags.Arch)
+	plz.Run(targets, opts.BuildFlags.PreTargets, state, config, state.TargetArch)
 	cancel()
 	wg.Wait()
 }
@@ -867,7 +969,7 @@ func testTargets(target core.BuildLabel, args []string, failed bool, resultsFile
 
 // readConfig reads the initial configuration files
 func readConfig(forceUpdate bool) *core.Configuration {
-	cfg, err := core.ReadDefaultConfigFiles(opts.BuildFlags.Profile.Strings())
+	cfg, err := core.ReadDefaultConfigFiles(opts.BuildFlags.Profile)
 	if err != nil {
 		log.Fatalf("Error reading config file: %s", err)
 	} else if err := cfg.ApplyOverrides(opts.BuildFlags.Option); err != nil {
@@ -905,7 +1007,11 @@ func readConfigAndSetRoot(forceUpdate bool) *core.Configuration {
 	if opts.BuildFlags.RepoRoot == "" {
 		log.Debug("Found repo root at %s", core.MustFindRepoRoot())
 	} else {
-		core.RepoRoot = string(opts.BuildFlags.RepoRoot)
+		abs, err := filepath.Abs(string(opts.BuildFlags.RepoRoot))
+		if err != nil {
+			log.Fatalf("Cannot make --repo_root absolute: %s", err)
+		}
+		core.RepoRoot = abs
 	}
 
 	// Save the current working directory before moving to root
@@ -931,12 +1037,13 @@ func readConfigAndSetRoot(forceUpdate bool) *core.Configuration {
 	}
 	config := readConfig(forceUpdate)
 	// Now apply any flags that override this
-	if opts.Update.Latest {
+	config.Profiling = opts.Profile != ""
+	if opts.Update.Latest || opts.Update.LatestPrerelease {
 		config.Please.Version.Unset()
 	} else if opts.Update.Version.IsSet {
 		config.Please.Version = opts.Update.Version
 	}
-	update.CheckAndUpdate(config, !opts.FeatureFlags.NoUpdate, forceUpdate, opts.Update.Force, !opts.Update.NoVerify, !opts.OutputFlags.PlainOutput)
+	update.CheckAndUpdate(config, !opts.FeatureFlags.NoUpdate, forceUpdate, opts.Update.Force, !opts.Update.NoVerify, !opts.OutputFlags.PlainOutput, opts.Update.LatestPrerelease)
 	return config
 }
 
@@ -960,6 +1067,11 @@ func handleCompletions(parser *flags.Parser, items []flags.Completion) {
 }
 
 func initBuild(args []string) string {
+	if len(args) > 1 && (args[1] == "sandbox") {
+		// Shortcut these as they're special commands used for please sandboxing
+		// going through the normal init path would be too slow
+		return args[1]
+	}
 	if _, present := os.LookupEnv("GO_FLAGS_COMPLETION"); present {
 		cli.InitLogging(cli.MinVerbosity)
 	}
@@ -1003,13 +1115,13 @@ func initBuild(args []string) string {
 		}
 		config = core.DefaultConfiguration()
 		if command == "tool" {
-			if cfg, err := core.ReadDefaultConfigFiles(opts.BuildFlags.Profile.Strings()); err == nil {
+			if cfg, err := core.ReadDefaultConfigFiles(opts.BuildFlags.Profile); err == nil {
 				config = cfg
 			}
 		}
 		os.Exit(buildFunctions[command]())
 	} else if opts.OutputFlags.CompletionScript {
-		fmt.Printf("%s\n", assets.MustAsset("plz_complete.sh"))
+		fmt.Printf("%s\n", string(assets.PlzComplete))
 		os.Exit(0)
 	}
 	// Read the config now
@@ -1083,6 +1195,17 @@ func execute(command string) int {
 		}
 		defer f.Close()
 		defer pprof.WriteHeapProfile(f)
+	}
+	if opts.MutexProfile != "" {
+		runtime.SetMutexProfileFraction(1)
+		f, err := os.Create(opts.MutexProfile)
+		if err != nil {
+			log.Fatalf("Failed to open mutex profile file: %s", err)
+		}
+		defer f.Close()
+		defer func() {
+			pprof.Lookup("mutex").WriteTo(f, 0)
+		}()
 	}
 	defer worker.StopAll()
 	return buildFunctions[command]()

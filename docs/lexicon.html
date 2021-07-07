@@ -228,6 +228,28 @@
         <code class="code">--plain_output</code> flag if intending to use this.
       </span>
     </li>
+    <li>
+      <span>
+        <code class="code"
+          ><span class="fn-name">is_semver</span><span class="fn-p">(</span
+          ><span class="fn-arg">s</span>
+          <span class="fn-p">)</span></code
+        >
+        - returns true if <code class="code">s</code> is a <a href="https://semver.org/">semantic version</a> (either
+        with or without a leading &quot;v&quot;), or false if not.
+      </span>
+    </li>
+    <li>
+      <span>
+        <code class="code"
+          ><span class="fn-name">semver_check</span><span class="fn-p">(</span
+          ><span class="fn-arg">version</span>, <span class="fn-arg">constraint</span>
+          <span class="fn-p">)</span></code
+        >
+        - checks if a <a href="https://semver.org/">semantic version</a> meets a constraint.
+        Supported version and constraint formats are listed on <a href="https://github.com/Masterminds/semver">this</a> site.
+      </span>
+    </li>
   </ul>
 
   <section class="mt4">
@@ -1080,6 +1102,18 @@
       </li>
     </ul>
   </section>
+
+  <section class="mt4">
+    <h3 class="title-3" id="fail">
+      fail
+    </h3>
+
+    <code class="code-signature">fail(message)</code>
+
+    <p>Causes an immediate failure in parsing of the current build file.</p>
+
+    <p>Use this where you might <code>raise</code> in Python.</p>
+  </section>
 </section>
 
 <section class="mt4">
@@ -1131,6 +1165,8 @@
   {{ template "lexicon_entry.html" .Named "go_test" }}
   {{ template "lexicon_entry.html" .Named "cgo_test" }}
   {{ template "lexicon_entry.html" .Named "go_test_main" }}
+  {{ template "lexicon_entry.html" .Named "go_module" }}
+  {{ template "lexicon_entry.html" .Named "go_mod_download" }}
   {{ template "lexicon_entry.html" .Named "go_get" }}
 </section>
 

@@ -3,6 +3,7 @@ go_library(
     srcs = glob(
         ["*.go"],
         exclude = [
+            "*_benchmark.go",
             "*_test.go",
             "*.bindata.go",
         ],
@@ -14,6 +15,7 @@ go_library(
         "//src/fs",
         "//third_party/go:logging",
         "//third_party/go:promptui",
+        "//third_party/go:semver2",
     ],
 )
 
@@ -69,5 +71,16 @@ go_test(
         ":asp",
         "//src/core",
         "//third_party/go:testify",
+    ],
+)
+
+go_benchmark(
+    name = "interpreter_benchmark",
+    srcs = ["interpreter_benchmark.go"],
+    data = ["test_data"],
+    deps = [
+        ":asp",
+        "//rules",
+        "//src/core",
     ],
 )

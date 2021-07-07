@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -42,9 +43,10 @@ func Test(tid int, state *core.BuildState, label core.BuildLabel, remote bool, r
 		runsAllCompleted := target.CompleteRun(state)
 		if runsAllCompleted && state.Config.Test.Upload != "" {
 			if numUploadFailures < maxUploadFailures {
-				if err := uploadResults(target, state.Config.Test.Upload.String()); err != nil {
-					log.Warning("%s", err)
-					if atomic.AddInt64(&numUploadFailures, 1) >= maxUploadFailures {
+				if err := uploadResults(target, state.Config.Test.Upload.String(), state.Config.Test.UploadGzipped, state.Config.Test.StoreTestOutputOnSuccess); err != nil {
+					if failures := atomic.AddInt64(&numUploadFailures, 1); failures < maxUploadFailures {
+						log.Warning("%s", err)
+					} else if failures == maxUploadFailures {
 						log.Error("Failed to upload test results %d times, giving up", maxUploadFailures)
 					}
 				}
@@ -57,7 +59,7 @@ func Test(tid int, state *core.BuildState, label core.BuildLabel, remote bool, r
 }
 
 func test(tid int, state *core.BuildState, label core.BuildLabel, target *core.BuildTarget, runRemotely bool, run int) {
-	hash, err := runtimeHash(state, target, runRemotely, run)
+	hash, err := runtimeHash(tid, state, target, runRemotely, run)
 	if err != nil {
 		state.LogBuildError(tid, label, core.TargetTestFailed, err, "Failed to calculate target hash")
 		return
@@ -69,12 +71,16 @@ func test(tid int, state *core.BuildState, label core.BuildLabel, target *core.B
 
 	// If the user passed --shell then just prepare the directory.
 	if state.PrepareShell {
+		if err := state.DownloadInputsIfNeeded(tid, target, true); err != nil {
+			state.LogBuildError(tid, label, core.TargetTestFailed, err, "Failed to download test inputs")
+			return
+		}
 		if err := prepareTestDir(state, target, run); err != nil {
 			state.LogBuildError(tid, label, core.TargetTestFailed, err, "Failed to prepare test directory")
-		} else {
-			target.SetState(core.Stopped)
-			state.LogBuildResult(tid, label, core.TargetTestStopped, "Test stopped")
+			return
 		}
+		target.SetState(core.Stopped)
+		state.LogBuildResult(tid, label, core.TargetTestStopped, "Test stopped")
 		return
 	}
 
@@ -82,7 +88,7 @@ func test(tid int, state *core.BuildState, label core.BuildLabel, target *core.B
 		log.Debug("Not re-running test %s; got cached results.", label)
 		coverage := parseCoverageFile(target, target.CoverageFile(), run)
 		results, err := parseTestResultsFile(target.TestResultsFile())
-		results.Package = strings.Replace(target.Label.PackageName, "/", ".", -1)
+		results.Package = strings.ReplaceAll(target.Label.PackageName, "/", ".")
 		results.Name = target.Label.Name
 		results.Cached = true
 		if err != nil {
@@ -161,7 +167,7 @@ func test(tid int, state *core.BuildState, label core.BuildLabel, target *core.B
 		if needCoverage {
 			files = append(files, path.Base(target.CoverageFile()))
 		}
-		return state.Cache == nil || !state.Cache.Retrieve(target, hash, files)
+		return !retrieveFromCache(state, target, hash, files)
 	}
 
 	// Don't cache when doing multiple runs, presumably the user explicitly wants to check it.
@@ -211,6 +217,26 @@ func test(tid int, state *core.BuildState, label core.BuildLabel, target *core.B
 	logTargetResults(tid, state, target, coverage, run)
 }
 
+func retrieveFromCache(state *core.BuildState, target *core.BuildTarget, hash []byte, files []string) bool {
+	if state.Cache == nil {
+		return false
+	}
+	if state.Cache.Retrieve(target, hash, files) {
+		// Record the xattr if we might've retrieved from the http cache.
+		if state.Config.Cache.HTTPURL != "" {
+			for _, f := range files {
+				fullPath := filepath.Join(target.OutDir(), f)
+				if err := fs.RecordAttr(fullPath, hash, xattrName, state.XattrsSupported); err != nil {
+					log.Warningf("%v failed to set hash on %s: %w", target, fullPath, err)
+					return false
+				}
+			}
+		}
+		return true // got from cache
+	}
+	return false
+}
+
 // doFlakeRun runs a test repeatably until it succeeds or exceeds the max number of flakes for the test
 func doFlakeRun(tid int, state *core.BuildState, target *core.BuildTarget, runRemotely bool) (core.TestSuite, *core.TestCoverage) {
 	coverage := &core.TestCoverage{}
@@ -258,7 +284,7 @@ func logTargetResults(tid int, state *core.BuildState, target *core.BuildTarget,
 	if target.Results.TestCases.AllSucceeded() {
 		// Clean up the test directory.
 		if state.CleanWorkdirs {
-			if err := os.RemoveAll(target.TestDir(run)); err != nil {
+			if err := fs.ForceRemove(state.ProcessExecutor, target.TestDir(run)); err != nil {
 				log.Warning("Failed to remove test directory for %s: %s", target.Label, err)
 			}
 		}
@@ -308,7 +334,7 @@ func pluralise(word string, quantity int) string {
 }
 
 func prepareTestDir(state *core.BuildState, target *core.BuildTarget, run int) error {
-	if err := os.RemoveAll(target.TestDir(run)); err != nil {
+	if err := fs.ForceRemove(state.ProcessExecutor, target.TestDir(run)); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(target.TestDir(run), core.DirPermissions); err != nil {
@@ -317,7 +343,7 @@ func prepareTestDir(state *core.BuildState, target *core.BuildTarget, run int) e
 	if err := state.EnsureDownloaded(target); err != nil {
 		return err
 	}
-	for out := range core.IterRuntimeFiles(state.Graph, target, true, run) {
+	for out := range core.IterRuntimeFiles(state.Graph, target, true, target.TestDir(run)) {
 		if err := core.PrepareSourcePair(out); err != nil {
 			return err
 		}
@@ -343,7 +369,7 @@ func runTest(state *core.BuildState, target *core.BuildTarget, run int) ([]byte,
 		return nil, err
 	}
 	log.Debugf("Running test %s#%d\nENVIRONMENT:\n%s\n%s", target.Label, run, strings.Join(env, "\n"), replacedCmd)
-	_, stderr, err := state.ProcessExecutor.ExecWithTimeoutShellStdStreams(target, target.TestDir(run), env, target.TestTimeout, state.ShowAllOutput, replacedCmd, target.TestSandbox, state.DebugTests)
+	_, stderr, err := state.ProcessExecutor.ExecWithTimeoutShellStdStreams(target, target.TestDir(run), env, target.TestTimeout, state.ShowAllOutput, target.TestSandbox, replacedCmd, state.DebugTests)
 	return stderr, err
 }
 
@@ -353,7 +379,7 @@ func doTest(tid int, state *core.BuildState, target *core.BuildTarget, runRemote
 	duration := time.Since(startTime)
 	parsedSuite := parseTestOutput(string(metadata.Stdout), string(metadata.Stderr), err, duration, target, resultsData)
 	return core.TestSuite{
-		Package:    strings.Replace(target.Label.PackageName, "/", ".", -1),
+		Package:    strings.ReplaceAll(target.Label.PackageName, "/", "."),
 		Name:       target.Label.Name,
 		Duration:   duration,
 		TimedOut:   err == context.DeadlineExceeded,
@@ -464,7 +490,7 @@ func parseTestOutput(stdout string, stderr string, runError error, duration time
 					},
 				}
 			}
-			//No output and no execution error and output expected - SYNTHETIC ERROR - Missing Results
+			// No output and no execution error and output expected - SYNTHETIC ERROR - Missing Results
 			return failSuite("Test failed to produce output results file", "MissingResults", "")
 		}
 		return failSuite("Test failed", "TestFailed", runError.Error())
@@ -561,9 +587,15 @@ func verifyHash(state *core.BuildState, filename string, hash []byte) bool {
 }
 
 // runtimeHash returns the runtime hash of a target, or an empty slice if running remotely.
-func runtimeHash(state *core.BuildState, target *core.BuildTarget, runRemotely bool, run int) ([]byte, error) {
+func runtimeHash(tid int, state *core.BuildState, target *core.BuildTarget, runRemotely bool, run int) ([]byte, error) {
 	if runRemotely {
 		return nil, nil
+	}
+	if target.Local {
+		// If the test is marked to run locally, download the inputs as we need these to calculate the runtime hash.
+		if err := state.DownloadInputsIfNeeded(tid, target, true); err != nil {
+			return nil, err
+		}
 	}
 	hash, err := build.RuntimeHash(state, target, run)
 	if err == nil {
